@@ -38,6 +38,7 @@ module TeamHub
   class Session
     POLL_INTERVAL = 1.5
     SCAN_DELAY = 0.8
+    MAX_PARALLEL_PUSHES = 4
     IDENTITY = Geom::Transformation.new
 
     attr_reader :model, :client, :me, :project, :status
@@ -79,6 +80,8 @@ module TeamHub
       @raw_count = 0
       @overlay_items = []
       @warned = {}
+      @touched = {}        # oid => true: may have changed locally, check on next scan
+      @recent = {}         # oid => [user_id, time]: just changed by a teammate (shown in the viewport)
       @temp = File.join(Sketchup.temp_dir, 'teamhub')
       FileUtils.mkdir_p(File.join(@temp, 'blobs'))
     end
@@ -92,8 +95,15 @@ module TeamHub
     def viewer?
       @me['role'] == 'viewer'
     end
+    # Everyone edits everything; a reservation is optional and only blocks others.
     def mine?(oid)
-      !viewer? && @locks[oid] == my_id
+      !viewer? && (@locks[oid].nil? || @locks[oid] == my_id)
+    end
+    def reserved_by_me?(oid)
+      @locks[oid] == my_id
+    end
+    def reserved_by_other?(oid)
+      !@locks[oid].nil? && @locks[oid] != my_id
     end
     def connected?
       @status == :online
@@ -178,6 +188,7 @@ module TeamHub
         end
       end
       rebuild_index
+      baseline_all
       reconcile_with_server
       @raw_count = count_raw_geometry
       apply_local_locks
@@ -207,6 +218,7 @@ module TeamHub
           @status = :online
           @online = data['online'] if data['online']
           data['events'].each { |e| handle_event(e) }
+          refresh_overlay if !@recent.empty? || data['events'].any?
           poll if data['events'].size >= data['limit'].to_i
           if was_offline
             when_idle { pump_pushes }
@@ -241,10 +253,11 @@ module TeamHub
       when 'object'
         oid = p['oid']
         @objects[oid] = p
-        unless mine?(oid) && p['updated_by'] == my_id
+        unless p['updated_by'] == my_id # my own upload coming back
+          @recent[oid] = [p['updated_by'], Time.now] unless p['kind'] == 'definition'
           if p['deleted']
             enqueue(p) if local_exists?(p)
-          elsif local_rev(p) != p['rev']
+          elsif local_rev(p) < p['rev']
             enqueue(p)
           end
         end
@@ -252,7 +265,7 @@ module TeamHub
         p['oids'].each { |o| @locks[o] = p['user_id'] }
         when_idle { apply_local_locks(p['oids']) }
       when 'unlock'
-        lost = p['oids'].select { |o| mine?(o) }
+        lost = p['oids'].select { |o| reserved_by_me?(o) }
         lost = [] if %w[release deleted].include?(p['reason'])
         p['oids'].each { |o| @locks.delete(o) }
         unless lost.empty?
@@ -320,34 +333,36 @@ module TeamHub
     end
 
     def local_exists?(obj)
+      return true if obj['oid'] == LOOSE_OID
       obj['kind'] == 'definition' ? !live_def(did_of(obj['oid'])).nil? : !live_entity(obj['oid']).nil?
     end
 
     def local_rev(obj)
+      return loose_rev if obj['oid'] == LOOSE_OID
       holder = obj['kind'] == 'definition' ? live_def(did_of(obj['oid'])) : live_entity(obj['oid'])
-      holder ? holder.get_attribute(DICT, 'rev', -1) : -1
+      # No revision on the entity = it is as it was in the shared file (rev 0).
+      holder ? holder.get_attribute(DICT, 'rev', 0).to_i : -1
     end
 
+    # Everyone starts from the same shared file, so only what changed on the
+    # server since then needs to come down. Objects the server has never seen
+    # are simply unchanged since the shared file.
     def reconcile_with_server
       defs, rest = @objects.values.partition { |o| o['kind'] == 'definition' }
       (defs + rest).each do |o|
-        oid = o['oid']
-        if mine?(oid) && local_exists?(o)
-          # Reserved by me: my local copy is the truth. Re-push it.
-          if o['kind'] == 'definition'
-            @def_dirty[did_of(oid)] = true
-          else
-            @content_dirty[oid] = true
-          end
-          next
-        end
         if o['deleted']
           enqueue(o) if local_exists?(o)
-        elsif local_rev(o) != o['rev']
-          enqueue(o)
+        elsif local_rev(o) < o['rev'].to_i
+          enqueue(o.merge('force' => true))
         end
       end
-      @index.each { |oid, ent| @added << ent unless @objects[oid] }
+    end
+
+    # Remember how every object looks now, so later scans only push real changes.
+    def baseline_all
+      @index.each_key { |oid| snapshot_fp(oid) }
+      @def_index.each_key { |did| snapshot_fp("d_#{did}") }
+      baseline_loose
     end
 
     # ------------------------------------------------------------ observers
@@ -361,7 +376,22 @@ module TeamHub
         elsif (did = root.definition.get_attribute(DICT, 'did'))
           @def_dirty[did] = true
         end
+        @touched[oid] = true
       end
+      mark_loose_dirty if root.nil?
+      # Moves, rotations, paint etc. on top-level objects act on the selection.
+      @model.selection.each do |e|
+        o = @eid_to_oid[e.entityID]
+        @touched[o] = true if o
+      end
+      schedule_scan
+    end
+
+    def on_modified(e)
+      return if @suspended.positive? || !@loaded
+      o = @eid_to_oid[e.entityID]
+      return unless o
+      @touched[o] = true
       schedule_scan
     end
 
@@ -374,12 +404,14 @@ module TeamHub
     def on_added(e)
       return if @suspended.positive? || !@loaded
       @added << e if e.is_a?(Sketchup::Group) || e.is_a?(Sketchup::ComponentInstance)
+      mark_loose_dirty if loose?(e)
       schedule_scan
     end
 
     def on_removed(eid)
       return if @suspended.positive? || !@loaded
       @removed << eid
+      mark_loose_dirty unless @eid_to_oid.key?(eid)
       schedule_scan
     end
 
@@ -394,21 +426,16 @@ module TeamHub
       return unless root
       oid = @eid_to_oid[root.entityID]
       return unless oid
-      unless mine?(oid) || @new_local[oid]
-        UI.start_timer(0, false) { @model.close_active rescue nil }
-        TeamHub.flash("احجز «#{display_name(root)}» قبل ما تعدل عليه")
-        return
+      @touched[oid] = true
+      blocked = reserved_by_other?(oid) ? oid : nil
+      if !blocked && root.is_a?(Sketchup::ComponentInstance)
+        did = root.definition.get_attribute(DICT, 'did')
+        blocked = "d_#{did}" if did && reserved_by_other?("d_#{did}")
       end
-      return unless root.is_a?(Sketchup::ComponentInstance)
-      did = root.definition.get_attribute(DICT, 'did')
-      d_oid = did && "d_#{did}"
-      return unless d_oid && @objects[d_oid] && !@objects[d_oid]['deleted'] && !mine?(d_oid)
-      lock_request([d_oid]) do |_granted, denied|
-        next if denied.empty?
-        holder = denied.first['user']
-        UI.start_timer(0, false) { @model.close_active rescue nil }
-        TeamHub.flash("تعريف المكوّن «#{root.definition.name}» محجوز من #{holder ? holder['display_name'] : 'عضو ثاني'}. تكدر تحركه، بس ما تكدر تعدل داخله.")
-      end
+      return unless blocked
+      holder = @users[@locks[blocked]] || {}
+      UI.start_timer(0, false) { @model.close_active rescue nil }
+      TeamHub.flash("«#{display_name(root)}» محجوز من #{holder['display_name'] || 'عضو ثاني'}، ما تكدر تعدل عليه هسه.")
     end
 
     # ------------------------------------------------------------ idle gate
@@ -482,8 +509,13 @@ module TeamHub
       process_added
       return notify if viewer?
 
-      @index.each do |oid, ent|
-        next unless ent.valid? && (mine?(oid) || @new_local[oid])
+      # Only objects that may have changed: the one being edited, the selection,
+      # anything SketchUp reported as modified, and new ones.
+      candidates = @touched.keys | @new_local.keys | @content_dirty.keys
+      @touched.clear
+      candidates.each do |oid|
+        ent = live_entity(oid)
+        next unless ent && mine?(oid)
         if ent.is_a?(Sketchup::ComponentInstance)
           did = ent.definition.get_attribute(DICT, 'did')
           if did.nil? || (live_def(did) && live_def(did) != ent.definition)
@@ -494,30 +526,26 @@ module TeamHub
         cfp = content_fp(ent)
         content = @content_dirty.delete(oid) || @new_local[oid] ||
                   (@content_fp.key?(oid) && @content_fp[oid] != cfp)
-        server = @objects[oid]
-        next unless content || server.nil? || server['deleted'] || @meta_fp[oid] != mfp
+        next unless content || !@meta_fp.key?(oid) || @meta_fp[oid] != mfp
         request_push(oid, content ? true : false)
       end
 
-      @def_index.each do |did, d|
-        next unless d.valid?
+      @def_dirty.keys.each do |did|
+        @def_dirty.delete(did)
+        d = live_def(did)
+        next unless d
         d_oid = "d_#{did}"
-        server = @objects[d_oid]
         if mine?(d_oid)
-          fp = defn_fp(d)
-          dirty = @def_dirty.delete(did) || (@content_fp.key?(d_oid) && @content_fp[d_oid] != fp)
-          request_push(d_oid, true) if dirty
-        elsif @def_dirty.delete(did)
-          if server.nil? || server['deleted']
-            request_push(d_oid, true)
-          else
-            TeamHub.flash("عدّلت داخل «#{d.name}» بدون ما تحجز تعريفه، فالتعديل ما راح يوصل للفريق. رجّعت النسخة الأصلية.")
-            enqueue(server.merge('force' => true))
-          end
+          request_push(d_oid, true)
+        else
+          holder = @users[@locks[d_oid]] || {}
+          TeamHub.flash("تعريف «#{d.name}» محجوز من #{holder['display_name'] || 'عضو ثاني'}، فتعديلك داخله ما يوصل. رجّعت النسخة الأصلية.")
+          server = @objects[d_oid]
+          enqueue(server.merge('force' => true)) if server && !server['deleted']
         end
       end
-      @def_dirty.clear
 
+      scan_loose
       @raw_count = count_raw_geometry
       apply_local_locks
       notify
@@ -537,40 +565,39 @@ module TeamHub
         @content_dirty.delete(oid)
         next if @new_local.delete(oid) && @objects[oid].nil?
         server = @objects[oid]
-        next unless server && !server['deleted']
+        next if server && server['deleted']
         if mine?(oid)
-          push_delete(oid)
-        else
-          enqueue(server.merge('force' => true)) # not allowed → put it back
+          push_delete(oid) # also for objects unchanged since the shared file
+        elsif server
+          enqueue(server.merge('force' => true)) # reserved by someone else → put it back
         end
       end
     end
 
+    # After Undo/Redo: my own changes that were undone go out as new versions;
+    # a teammate's change that got undone along with mine comes back.
     def after_undo_reconcile
       rebuild_index
       @objects.each_value do |o|
         oid = o['oid']
-        if mine?(oid)
-          if local_exists?(o)
-            o['kind'] == 'definition' ? (@def_dirty[did_of(oid)] = true) : (@content_dirty[oid] = true)
-          elsif !o['deleted'] && o['kind'] != 'definition'
-            push_delete(oid)
-          end
-          next
-        end
-        if o['deleted'] && local_exists?(o)
-          if o['updated_by'] == my_id && o['kind'] != 'definition' && !viewer?
-            # I deleted it and then pressed Undo: bring it back for everyone.
-            @new_local[oid] = true
+        mine_last = o['updated_by'] == my_id
+        if o['deleted']
+          next unless local_exists?(o)
+          if mine_last && o['kind'] != 'definition' && !viewer?
+            @new_local[oid] = true # I deleted it, then pressed Undo
             @content_dirty[oid] = true
-            @locks[oid] = my_id
           else
             enqueue(o)
           end
-        elsif !o['deleted'] && local_rev(o) != o['rev']
-          enqueue(o)
+        elsif local_exists?(o)
+          if local_rev(o) < o['rev'].to_i
+            mine_last ? (@content_dirty[oid] = true) : enqueue(o.merge('force' => true))
+          end
+        elsif o['kind'] != 'definition'
+          mine_last && mine?(oid) ? push_delete(oid) : enqueue(o.merge('force' => true))
         end
       end
+      @index.each_key { |oid| @touched[oid] = true }
     end
 
     def process_added
@@ -647,6 +674,9 @@ module TeamHub
       return unless connected? && !@stopped
       @delete_wanted.keys.each { |oid| @delete_wanted.delete(oid); push_delete(oid) }
       @push_wanted.keys.each do |oid|
+        # A few uploads at a time: a 1,000-object model must not export and
+        # send everything in one go (memory + a long UI freeze).
+        break if @pushing.size >= MAX_PARALLEL_PUSHES
         next if @pushing[oid]
         content = @push_wanted.delete(oid)
         push_now(oid, content)
@@ -654,6 +684,7 @@ module TeamHub
     end
 
     def push_now(oid, content)
+      return push_loose if oid == LOOSE_OID
       if oid.start_with?('d_')
         d = live_def(did_of(oid))
         return unless d
@@ -713,7 +744,6 @@ module TeamHub
       when 200
         obj = data['object']
         @objects[oid] = obj
-        @locks[oid] = my_id
         @new_local.delete(oid)
         @meta_fp[oid] = mfp if mfp
         @content_fp[oid] = fp if fp
@@ -721,8 +751,12 @@ module TeamHub
         holder = oid.start_with?('d_') ? live_def(did_of(oid)) : live_entity(oid)
         if holder.nil?
           push_delete(oid) unless oid.start_with?('d_') # deleted while uploading
-        elsif @release_after.delete(oid) && !@push_wanted.key?(oid)
-          send_unlock([oid])
+        else
+          # My copy now is that revision: remember it in the model, so reopening
+          # the file doesn't download my own change again.
+          rev = obj['rev']
+          when_idle { model_op('Team Hub') { holder.set_attribute(DICT, 'rev', rev) if holder.valid? } }
+          send_unlock([oid]) if @release_after.delete(oid) && !@push_wanted.key?(oid)
         end
         if @mode == :upload && @push_wanted.empty? && @pushing.empty? && @new_local.empty?
           # Initial upload finished: hand everything over to the team.
@@ -757,8 +791,8 @@ module TeamHub
 
     def push_delete(oid)
       server = @objects[oid]
-      return unless server && !server['deleted']
-      @client.request(:delete, "/api/projects/#{pid}/objects/#{oid}?base_rev=#{server['rev']}") do |st, data|
+      return if server && server['deleted']
+      @client.request(:delete, "/api/projects/#{pid}/objects/#{oid}") do |st, data|
         next if @stopped
         case st
         when 200
@@ -768,8 +802,9 @@ module TeamHub
           @delete_wanted[oid] = true
           @status = :offline
         else
-          TeamHub.flash("ما انحذف «#{object_label(oid)}» من المشروع (#{data && data['error']}). رجّعته.")
-          enqueue(server.merge('force' => true))
+          holder = data && data['user']
+          TeamHub.flash("ما انحذف «#{object_label(oid)}»: #{holder ? "محجوز من #{holder['display_name']}" : data && data['error']}. رجّعته.")
+          enqueue(server.merge('force' => true)) if server
         end
         notify
       end
@@ -832,15 +867,33 @@ module TeamHub
     def apply_object(obj, path)
       return if @stopped
       oid = obj['oid']
-      return if mine?(oid) && local_exists?(obj) && !obj['force']
+      latest = @objects[oid]
+      # A newer revision exists (often my own edit that won): this one is stale.
+      return if latest && latest['rev'].to_i > obj['rev'].to_i
+      return if latest && latest['updated_by'] == my_id && !obj['force'] && local_exists?(obj)
+      if editing_now?(oid) || @pushing[oid] || @push_wanted.key?(oid)
+        # I'm in the middle of it: let me finish; whoever saves last wins.
+        UI.start_timer(2, false) { enqueue(obj) unless @stopped }
+        return
+      end
       model_op('Team Hub: تحديث من الفريق') do
         case obj['kind']
         when 'definition' then apply_definition(obj, path)
         when 'group' then apply_group(obj, path)
+        when 'loose' then apply_loose(obj, path)
         else apply_component(obj)
         end
       end
+      snapshot_fp(oid)
       refresh_overlay
+    end
+
+    def editing_now?(oid)
+      return editing_loose_now? if oid == LOOSE_OID
+      root = (@model.active_path || []).first
+      root && @eid_to_oid[root.entityID] == oid
+    rescue StandardError
+      false
     end
 
     def apply_definition(obj, path)
@@ -1058,6 +1111,7 @@ module TeamHub
 
     def reserve(entities)
       return TeamHub.flash('حسابك مشاهدة فقط') if viewer?
+      entities = group_selected_loose(entities)
       oids = oids_for(entities)
       return TeamHub.flash('حدد Group أو Component من الموديل أول') if oids.empty?
       lock_request(oids) do |granted, denied|
@@ -1081,7 +1135,7 @@ module TeamHub
     end
 
     def release(oids)
-      oids = oids.select { |o| mine?(o) }
+      oids = oids.select { |o| reserved_by_me?(o) }
       return TeamHub.flash('ماكو حجوزات إلك بالتحديد') if oids.empty?
       scan if @loaded && !busy? # flush pending edits first
       pending = oids.select { |o| @pushing[o] || @push_wanted.key?(o) }
@@ -1163,17 +1217,25 @@ module TeamHub
     end
 
     def refresh_overlay
+      # Reservations (mine dashed, others solid) + what a teammate changed in the
+      # last few seconds, so you see the other person working live.
       items = []
-      @index.each do |oid, e|
-        next unless e.valid?
-        uid = @locks[oid]
-        if mine?(oid) || @new_local[oid]
-          items << [e, color_of(my_id), 'أنت', true]
-        elsif uid
-          items << [e, color_of(uid), (@users[uid] || {})['display_name'] || '؟', false]
-        end
+      @locks.each do |oid, uid|
+        e = live_entity(oid)
+        next unless e
+        name = uid == my_id ? 'محجوز إلك' : "محجوز: #{(@users[uid] || {})['display_name'] || '؟'}"
+        items << [e, color_of(uid), name, uid == my_id]
       end
+      now = Time.now
+      @recent.delete_if { |_, (_, at)| now - at > 8 }
+      @recent.each do |oid, (uid, _)|
+        e = live_entity(oid)
+        next unless e && !@locks[oid]
+        items << [e, color_of(uid), "✎ #{(@users[uid] || {})['display_name'] || '؟'}", false]
+      end
+      changed = items.map { |e, *_| e.entityID } != (@overlay_items || []).map { |e, *_| e.valid? ? e.entityID : 0 }
       @overlay_items = items
+      return unless changed || !items.empty?
       @model.active_view.invalidate
     rescue StandardError
       nil
@@ -1196,7 +1258,7 @@ module TeamHub
           kind: e.is_a?(Sketchup::Group) ? 'group' : 'component',
           layer: (e.layer.display_name rescue ''),
           lock: @locks[oid],
-          mine: mine?(oid) || @new_local[oid] ? true : false,
+          mine: reserved_by_me?(oid),
           rev: @objects.dig(oid, 'rev'),
           pending: (@push_wanted.key?(oid) || @pushing[oid]) ? true : false,
         }
@@ -1250,6 +1312,9 @@ module TeamHub
     end
     def onElementAdded(_entities, entity)
       @s.guard { @s.on_added(entity) }
+    end
+    def onElementModified(_entities, entity)
+      @s.guard { @s.on_modified(entity) }
     end
     def onElementRemoved(_entities, entity_id)
       @s.guard { @s.on_removed(entity_id) }

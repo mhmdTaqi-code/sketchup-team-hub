@@ -4,8 +4,10 @@
 require 'json'
 require 'su_team_hub/client'
 require 'su_team_hub/session'
+require 'su_team_hub/loose'
 require 'su_team_hub/overlay'
 require 'su_team_hub/panel'
+require 'su_team_hub/shared'
 
 module TeamHub
   PREFS = 'TeamHub'.freeze
@@ -99,6 +101,8 @@ module TeamHub
         model_empty: model ? model_empty?(model) : true,
         model_title: model ? model.title : '',
         busy: @busy,
+        busy_text: @busy_text,
+        model_saved: model ? !model.path.to_s.empty? : false,
         update: @update,
         su_version: su_version_label,
       }
@@ -276,8 +280,9 @@ module TeamHub
     # Reconnect automatically when a file bound to a project is opened.
     def auto_connect(model)
       binding = model_binding(model)
+      # The shared file comes from the owner's PC, so the address stored in it is
+      # theirs; what matters is the project on the server I'm signed in to.
       return unless binding && logged_in?
-      return unless Client.normalize(binding['server']) == Client.normalize(pref('server'))
       load_projects do
         project = (@projects || []).find { |p| p['id'] == binding['project_id'] }
         if project && Sketchup.active_model == model
@@ -307,6 +312,8 @@ module TeamHub
           st == 200 ? load_projects : flash("ما انشأ المشروع (#{data && data['error']})")
         end
       when 'connect' then connect(payload['project_id'], payload['mode'])
+      when 'share' then share_file
+      when 'download_file' then download_shared(payload['project_id'])
       when 'disconnect' then stop_session
       when 'reserve' then s&.reserve(Sketchup.active_model.selection.to_a)
       when 'release' then s&.release_entities(Sketchup.active_model.selection.to_a)

@@ -135,6 +135,13 @@ db.exec(`
     created_at INTEGER NOT NULL
   );
   CREATE INDEX IF NOT EXISTS events_seq ON events (project_id, seq);
+  CREATE TABLE IF NOT EXISTS invites (
+    code TEXT PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    created_at INTEGER NOT NULL,
+    expires_at INTEGER NOT NULL,
+    used_at INTEGER
+  );
 `);
 
 // Migrations: a project is either a SketchUp project (objects synced through
@@ -493,12 +500,10 @@ function writeObject(pid, user, oid, body) {
     const obj = q.object.get(pid, oid);
     const lock = q.lock.get(pid, oid);
     const live = obj && !obj.deleted;
+    // Anyone may edit anything; a reservation (optional) blocks everyone else.
+    // Without one, the last write wins.
     if (lock && lock.user_id !== user.id) {
       throw httpError(423, 'locked_by_other', { user: userBrief(lock.user_id) });
-    }
-    if (live && !lock) throw httpError(423, 'not_reserved');
-    if (live && Number(body.base_rev) !== obj.rev) {
-      throw httpError(409, 'rev_conflict', { rev: obj.rev });
     }
     let blob = obj ? obj.blob : null;
     let size = obj ? obj.size : null;
@@ -510,7 +515,8 @@ function writeObject(pid, user, oid, body) {
     }
     // group: blob = its contents. definition: blob = a component definition.
     // component: an instance placed at top level; no blob, meta.def names the definition object.
-    const kind = ['group', 'component', 'definition'].includes(body.kind) ? body.kind : 'group';
+    // loose: all the loose edges/faces at the top level of the model, as one piece.
+    const kind = ['group', 'component', 'definition', 'loose'].includes(body.kind) ? body.kind : 'group';
     if (kind === 'component') { blob = null; size = null; }
     else if (!blob) throw httpError(400, 'data_required');
     const name = String(body.name ?? '').slice(0, 200);
@@ -521,11 +527,6 @@ function writeObject(pid, user, oid, body) {
     q.upsertObject.run(pid, oid, rev, kind, name, layer, meta, blob, size, 0, user.id, t);
     q.insertRevision.run(pid, oid, rev, kind, name, layer, meta, blob, size, 0, user.id,
       body.note ? String(body.note).slice(0, 500) : null, t);
-    if (!lock) {
-      // A brand-new (or re-created) object is reserved by its author.
-      q.insertLock.run(pid, oid, user.id, t);
-      emit(pid, 'lock', { oids: [oid], user_id: user.id }, user.id);
-    }
     const out = serializeObject(q.object.get(pid, oid));
     emit(pid, 'object', out, user.id);
     return out;
@@ -534,16 +535,18 @@ function writeObject(pid, user, oid, body) {
 
 function deleteObject(pid, user, oid, baseRev) {
   return tx(() => {
-    const obj = q.object.get(pid, oid);
-    if (!obj || obj.deleted) return { ok: true, already: true };
+    let obj = q.object.get(pid, oid);
+    if (obj && obj.deleted) return { ok: true, already: true };
     const lock = q.lock.get(pid, oid);
-    if (!lock || lock.user_id !== user.id) {
-      if (!(user.role === 'admin' && lock == null)) {
-        throw httpError(423, lock ? 'locked_by_other' : 'not_reserved',
-          lock ? { user: userBrief(lock.user_id) } : undefined);
-      }
+    if (lock && lock.user_id !== user.id) {
+      throw httpError(423, 'locked_by_other', { user: userBrief(lock.user_id) });
     }
-    if (baseRev != null && Number(baseRev) !== obj.rev) throw httpError(409, 'rev_conflict', { rev: obj.rev });
+    if (!obj) {
+      // Never changed since the shared file was handed out: record the deletion
+      // so everyone who opened that file removes it too.
+      if (!/^[A-Za-z0-9_-]{6,64}$/.test(oid)) throw httpError(400, 'invalid_oid');
+      obj = { rev: 0, kind: 'group', name: '', layer: '', meta: '{}', blob: null, size: null };
+    }
     const rev = obj.rev + 1;
     const t = now();
     q.upsertObject.run(pid, oid, rev, obj.kind, obj.name, obj.layer, obj.meta, obj.blob, obj.size, 1, user.id, t);
@@ -730,7 +733,7 @@ route('PATCH', '/api/users/:id', async (ctx) => {
 route('GET', '/api/projects', (ctx) => {
   requireRole(ctx.user, 'admin', 'editor', 'viewer');
   const all = ctx.url.searchParams.get('all') === '1' && ctx.user.role === 'admin';
-  return { projects: q.projects.all(all ? 1 : 0).map((p) => ({ ...p, online: onlineList(p.id).length })) };
+  return { projects: q.projects.all(all ? 1 : 0).map((p) => ({ ...p, online: onlineList(p.id).length, file: sharedFileInfo(p) })) };
 });
 
 route('POST', '/api/projects', async (ctx) => {
@@ -864,6 +867,182 @@ route('GET', '/api/blobs/:sha', (ctx) => {
   ctx.res.end(buf);
   return undefined;
 });
+
+// ---------------------------------------------------------------- shared file
+//
+// Instead of downloading a project object by object, a teammate downloads the
+// whole .skp once (the "shared file") and starts from it; after that only the
+// objects that change travel. Upload/download go in base64 chunks so the
+// SketchUp plugin never blocks on one huge request.
+
+const FILES_DIR = path.join(DATA_DIR, 'files');
+const CHUNK_MAX = 8 * 1024 * 1024;
+const uploads = new Map(); // upload_id -> { pid, path, next, user }
+
+function sharedFilePath(pid) { return path.join(FILES_DIR, `${Number(pid)}.skp`); }
+
+function sharedFileInfo(p) {
+  const f = sharedFilePath(p.id);
+  if (!fs.existsSync(f)) return null;
+  let meta = {};
+  try { meta = JSON.parse(fs.readFileSync(`${f}.json`, 'utf8')); } catch { /* none */ }
+  return { size: fs.statSync(f).size, name: meta.name || p.name, uploaded_at: meta.uploaded_at, uploaded_by: meta.uploaded_by,
+    sketchup: meta.sketchup || null, chunk: 2 * 1024 * 1024 };
+}
+
+route('POST', '/api/projects/:pid/file/chunk', async (ctx) => {
+  requireRole(ctx.user, 'admin', 'editor');
+  const p = getProject(ctx.params.pid);
+  const b = await readJson(ctx.req);
+  const index = Number(b.index);
+  const buf = Buffer.from(String(b.data || ''), 'base64');
+  if (buf.length > CHUNK_MAX) throw httpError(413, 'chunk_too_large');
+  fs.mkdirSync(FILES_DIR, { recursive: true });
+  let up = uploads.get(b.upload_id);
+  if (index === 0) {
+    up = { pid: p.id, path: path.join(FILES_DIR, `upload_${crypto.randomBytes(6).toString('hex')}.part`), next: 0, user: ctx.user.id };
+    fs.writeFileSync(up.path, Buffer.alloc(0));
+    b.upload_id = crypto.randomBytes(9).toString('hex');
+    uploads.set(b.upload_id, up);
+  }
+  if (!up || up.pid !== p.id || up.user !== ctx.user.id) throw httpError(400, 'unknown_upload');
+  if (index !== up.next) throw httpError(409, 'wrong_chunk', { expected: up.next });
+  fs.appendFileSync(up.path, buf);
+  up.next += 1;
+  if (b.final) {
+    uploads.delete(b.upload_id);
+    const dest = sharedFilePath(p.id);
+    fs.renameSync(up.path, dest);
+    fs.writeFileSync(`${dest}.json`, JSON.stringify({
+      name: String(b.name || p.name).slice(0, 200), uploaded_at: now(), uploaded_by: ctx.user.id,
+      sketchup: b.sketchup ? String(b.sketchup).slice(0, 40) : null,
+    }));
+    tx(() => emit(p.id, 'shared_file', { size: fs.statSync(dest).size, name: b.name || p.name }, ctx.user.id));
+    return { ok: true, done: true, file: sharedFileInfo(p) };
+  }
+  return { ok: true, upload_id: b.upload_id, next: up.next };
+});
+
+route('GET', '/api/projects/:pid/file', (ctx) => {
+  requireRole(ctx.user, 'admin', 'editor', 'viewer');
+  const p = getProject(ctx.params.pid);
+  const info = sharedFileInfo(p);
+  if (!info) throw httpError(404, 'no_shared_file');
+  const offset = ctx.url.searchParams.get('offset');
+  if (offset == null) return { file: info, seq: p.seq };
+  const len = Math.min(Number(ctx.url.searchParams.get('length')) || info.chunk, CHUNK_MAX);
+  const fd = fs.openSync(sharedFilePath(p.id), 'r');
+  try {
+    const buf = Buffer.alloc(Math.max(0, Math.min(len, info.size - Number(offset))));
+    fs.readSync(fd, buf, 0, buf.length, Number(offset));
+    return { data: buf.toString('base64'), offset: Number(offset), length: buf.length, size: info.size };
+  } finally {
+    fs.closeSync(fd);
+  }
+});
+
+// ---------------------------------------------------------------- invites
+//
+// An invite is a one-time link for a teammate. The page explains the steps and
+// hands out a copy of the SketchUp plugin that already contains the server
+// address and the invite code, so after installing it the teammate is signed
+// in without typing anything.
+
+const INVITE_DAYS = 14;
+
+function randomPassword() {
+  const abc = 'abcdefghjkmnpqrstuvwxyz23456789';
+  return Array.from(crypto.randomBytes(10), (b) => abc[b % abc.length]).join('');
+}
+
+function createInvite(userId) {
+  const code = crypto.randomBytes(9).toString('base64url');
+  db.prepare('INSERT INTO invites (code, user_id, created_at, expires_at) VALUES (?, ?, ?, ?)')
+    .run(code, userId, now(), now() + INVITE_DAYS * 86_400_000);
+  return code;
+}
+
+function inviteFor(code) {
+  const inv = db.prepare('SELECT * FROM invites WHERE code = ?').get(String(code || ''));
+  if (!inv) return null;
+  const user = q.userById.get(inv.user_id);
+  if (!user || !user.active) return null;
+  return { ...inv, user, expired: inv.expires_at < now() };
+}
+
+// Creates the member if needed (random password) and returns an invite for them.
+function inviteMember({ username, display_name, role }) {
+  let user = q.userByName.get(String(username || '').trim());
+  let password = null;
+  if (!user) {
+    password = randomPassword();
+    user = createUser({ username, display_name, password, role: role || 'editor' });
+  }
+  return { user: publicUser(user), password, code: createInvite(user.id) };
+}
+
+route('POST', '/api/invites', async (ctx) => {
+  requireRole(ctx.user, 'admin');
+  const b = await readJson(ctx.req);
+  const out = inviteMember(b);
+  const host = ctx.req.headers.host || `localhost:${config.port}`;
+  return { ...out, link: `http://${host}/invite/${out.code}` };
+});
+
+route('POST', '/api/invites/redeem', async (ctx) => {
+  const b = await readJson(ctx.req);
+  const inv = inviteFor(b.code);
+  if (!inv) throw httpError(404, 'invite_not_found');
+  if (inv.expired) throw httpError(410, 'invite_expired');
+  if (inv.used_at) throw httpError(409, 'invite_used');
+  db.prepare('UPDATE invites SET used_at = ? WHERE code = ?').run(now(), inv.code);
+  const token = crypto.randomBytes(32).toString('hex');
+  q.tokenInsert.run(token, inv.user.id, String(b.client || 'sketchup').slice(0, 40), now(), now());
+  return { token, user: publicUser(inv.user) };
+});
+
+// The plugin with this invite baked in (su_team_hub/invite.json).
+function personalizedPlugin(code, serverUrl) {
+  const { zip, listFiles } = require(path.join(ROOT, '..', 'tools', 'zip.js'));
+  const src = path.join(ROOT, '..', 'plugin');
+  if (!fs.existsSync(path.join(src, 'su_team_hub.rb'))) return null;
+  const files = ['su_team_hub.rb', ...listFiles(path.join(src, 'su_team_hub')).map((f) => `su_team_hub/${f}`)]
+    .filter((f) => f !== 'su_team_hub/invite.json');
+  const entries = files.map((name) => ({ name, data: fs.readFileSync(path.join(src, name)) }));
+  entries.push({ name: 'su_team_hub/invite.json', data: Buffer.from(JSON.stringify({ server: serverUrl, code })) });
+  return zip(entries);
+}
+
+function invitePage(inv, host) {
+  const esc = (t) => String(t ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+  const name = esc(inv.user.display_name);
+  const state = inv.used_at ? 'used' : inv.expired ? 'expired' : 'ok';
+  const dl = `/invite/${encodeURIComponent(inv.code)}/su_team_hub.rbz`;
+  return `<!doctype html><html lang="ar" dir="rtl"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1"><title>دعوة Team Hub</title>
+<style>
+:root{--bg:#f4f5f7;--s:#fff;--t:#1c1f24;--m:#6b7280;--b:#e3e6ea;--a:#c2410c}
+@media (prefers-color-scheme:dark){:root{--bg:#121417;--s:#1b1e23;--t:#e8eaed;--m:#9aa1ab;--b:#2b3038;--a:#fb923c}}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--t);font:15px/1.7 "Segoe UI",Tahoma,sans-serif;padding:16px}
+.c{max-width:620px;margin:24px auto;background:var(--s);border:1px solid var(--b);border-radius:14px;padding:24px}
+h1{font-size:22px;margin:0 0 6px}.m{color:var(--m)}ol{padding-inline-start:22px}li{margin:10px 0}
+.btn{display:inline-block;background:var(--a);color:#fff;text-decoration:none;padding:12px 22px;border-radius:10px;font-weight:600;font-size:16px}
+code{background:var(--bg);padding:2px 7px;border-radius:5px;direction:ltr;display:inline-block}
+.warn{background:#fff6e5;color:#92400e;padding:10px 14px;border-radius:9px}
+</style></head><body><div class="c">
+<h1>هلا ${name} 👋</h1>
+<p class="m">انعزمت تشتغل ويا الفريق على نفس موديل SketchUp.</p>
+${state === 'ok' ? `
+<ol>
+<li><b>نزّل البلكن الخاص بيك</b> (بيه حسابك جاهز):<br><br><a class="btn" href="${dl}">⬇ تحميل البلكن</a></li>
+<li>افتح <b>SketchUp</b> ← <b>Extensions</b> ← <b>Extension Manager</b> ← <b>Install Extension</b> ← اختار الملف اللي نزل.</li>
+<li>تنفتح لوحة <b>Team Hub</b> وحدها وانت داخل بحسابك. اختار المشروع ودوس <b>تحميل المشروع</b>. خلص 🎉</li>
+</ol>
+<p class="m">البلكن يشتغل على SketchUp 2022 وأحدث. لازم يبقى Radmin VPN شغال ومتصل بشبكة الفريق.</p>
+<p class="m">إذا احتجت تسجل دخول بإيدك بعدين: العنوان <code>http://${esc(host)}</code> واسم المستخدم <code>${esc(inv.user.username)}</code>.</p>`
+: `<p class="warn">${state === 'used' ? 'هذي الدعوة انستخدمت من قبل. إذا تحتاج تنصب مرة ثانية، اطلب دعوة جديدة من صاحب السيرفر.' : 'هذي الدعوة خلصت مدتها. اطلب وحدة جديدة من صاحب السيرفر.'}</p>`}
+</div></body></html>`;
+}
 
 // ---------------------------------------------------------------- Revit live sync
 //
@@ -1005,6 +1184,39 @@ const server = http.createServer(async (req, res) => {
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PATCH, DELETE, OPTIONS');
   if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return; }
 
+  const fileMatch = /^\/download\/project\/(\d+)\.skp$/.exec(url.pathname);
+  if (fileMatch && req.method === 'GET') {
+    const user = authenticate(req, url);
+    const p = q.project.get(Number(fileMatch[1]));
+    if (!user || !p || !fs.existsSync(sharedFilePath(p.id))) { res.writeHead(404); res.end('not found'); return; }
+    const buf = fs.readFileSync(sharedFilePath(p.id));
+    const fname = encodeURIComponent((sharedFileInfo(p).name || p.name).replace(/\.skp$/i, '') + '.skp');
+    res.writeHead(200, { 'Content-Type': 'application/octet-stream', 'Content-Length': buf.length,
+      'Content-Disposition': `attachment; filename*=UTF-8''${fname}` });
+    res.end(buf);
+    return;
+  }
+  const inviteMatch = /^\/invite\/([A-Za-z0-9_-]{6,40})(\/su_team_hub\.rbz)?$/.exec(url.pathname);
+  if (inviteMatch && req.method === 'GET') {
+    const inv = inviteFor(inviteMatch[1]);
+    const host = req.headers.host || `localhost:${config.port}`;
+    if (!inv) { res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' }); res.end('الدعوة مو موجودة'); return; }
+    if (!inviteMatch[2]) {
+      const html = Buffer.from(invitePage(inv, host));
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Content-Length': html.length });
+      res.end(html);
+      return;
+    }
+    if (inv.used_at || inv.expired) { res.writeHead(410, { 'Content-Type': 'text/plain; charset=utf-8' }); res.end('الدعوة انستخدمت أو خلصت'); return; }
+    const rbz = personalizedPlugin(inv.code, `http://${host}`);
+    if (!rbz) { send(res, 404, { error: 'plugin_not_found' }); return; }
+    res.writeHead(200, {
+      'Content-Type': 'application/octet-stream', 'Content-Length': rbz.length,
+      'Content-Disposition': 'attachment; filename="su_team_hub.rbz"',
+    });
+    res.end(rbz);
+    return;
+  }
   const DOWNLOADS = { '/download/su_team_hub.rbz': 'su_team_hub.rbz', '/download/teamhub_revit.zip': 'teamhub_revit.zip' };
   if (DOWNLOADS[url.pathname] && req.method === 'GET') {
     // Public on purpose: a new member needs the plugin before they have an account set up.

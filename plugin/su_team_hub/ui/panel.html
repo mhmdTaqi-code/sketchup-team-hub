@@ -80,6 +80,7 @@
     <span id="who" class="muted"></span>
   </div>
 
+  <div id="busy" class="warn hidden" style="font-weight:600"></div>
   <div id="update" class="warn row hidden">
     <span class="grow" id="update-text"></span>
     <button class="primary small" data-act="update_plugin">تحديث</button>
@@ -119,7 +120,7 @@
       </div>
       <div class="stats" id="stats"></div>
       <div class="grid3" style="margin-top:10px">
-        <button class="primary" data-act="reserve" title="احجز العناصر المحددة حتى تعدل عليها">حجز المحدد</button>
+        <button class="primary" data-act="reserve" title="اختياري: محد غيرك يكدر يعدل على المحدد لحد ما تفكه">حجز المحدد</button>
         <button data-act="release" title="يرفع آخر تعديلاتك ويفك الحجز">إلغاء حجز المحدد</button>
         <button data-act="release_all">إلغاء كل حجوزاتي</button>
       </div>
@@ -160,6 +161,7 @@
     </div>
 
     <div class="foot">
+      <button class="link" data-act="share">رفع الملف المشترك من جديد</button>
       <button class="link" data-act="resync">مزامنة كاملة</button>
       <button class="link" data-act="dashboard">لوحة التحكم</button>
       <button class="link" data-act="disconnect">قطع الاتصال</button>
@@ -196,6 +198,9 @@ const TH = {
     $('#live').classList.toggle('hidden', !s.connected);
     $('#logout').classList.toggle('hidden', !loggedIn);
     $('#who').textContent = s.me ? s.me.display_name : '';
+    const bz = $('#busy');
+    bz.textContent = s.busy_text || '';
+    bz.classList.toggle('hidden', !s.busy_text);
     const st = $('#status');
     st.classList.toggle('hidden', !s.connected);
     if (s.connected) { st.textContent = STATUS[s.status] || s.status; st.className = `pill ${s.status}`; }
@@ -221,23 +226,22 @@ const TH = {
 
   renderChoose(s) {
     const b = s.binding;
+    const canShare = s.me && s.me.role !== 'viewer' && !s.model_empty;
     $('#file-info').innerHTML = `<div><b>${esc(s.model_title || 'بدون اسم')}</b></div>` + (b
       ? `<div class="sub">مربوط بمشروع «${esc(b.project_name)}»</div>`
-      : `<div class="sub">${s.model_empty ? 'ملف فارغ، تكدر تحمّل بيه مشروع' : 'ملف مو مربوط بأي مشروع'}</div>`);
+      : `<div class="sub">${s.model_empty ? 'ملف فارغ' : 'ملف مو مربوط بأي مشروع'}</div>`) +
+      (canShare ? `<button class="primary" data-act="share" style="width:100%;margin-top:8px">⇪ مشاركة هذا الملف ويا الفريق</button>
+        <div class="sub" style="margin-top:4px">يرفع الملف كامل مرة وحدة، وصديقك ينزله ويبدي وياك.${s.model_saved ? '' : ' احفظه أول.'}</div>` : '');
     const admin = s.me && s.me.role === 'admin';
     $('#new-project').classList.toggle('hidden', !admin);
     const projects = s.projects || [];
     $('#projects').innerHTML = projects.length ? projects.map((p) => {
       let actions = '';
       if (b && b.project_id === p.id) actions = `<button class="primary small" data-connect="${p.id}" data-mode="resume">اتصال</button>`;
-      else if (!b) {
-        actions = `<button class="small ${s.model_empty ? 'primary' : ''}" data-connect="${p.id}" data-mode="download" title="ينزل المشروع كامل بملف فارغ">تحميل المشروع</button>`;
-        if (!s.model_empty && p.objects === 0 && s.me.role !== 'viewer') {
-          actions += ` <button class="small primary" data-connect="${p.id}" data-mode="upload" title="يرفع محتوى هذا الملف كبداية للمشروع">رفع هذا الملف</button>`;
-        }
-      }
+      else if (p.file) actions = `<button class="primary small" data-download="${p.id}">⇩ تحميل الملف المشترك</button>`;
+      const fileInfo = p.file ? `ملف مشترك ${(p.file.size / 1048576).toFixed(1)} MB` : 'ماكو ملف مشترك بعد';
       return `<li class="item"><div class="grow" style="flex:1;min-width:0"><b>${esc(p.name)}</b>
-        <div class="sub">${p.objects} عنصر · ${p.online} متصل</div></div><div class="row">${actions}</div></li>`;
+        <div class="sub">${fileInfo} · ${p.online} متصل</div></div><div class="row">${actions}</div></li>`;
     }).join('') : '<li class="muted">ماكو مشاريع</li>';
   },
 
@@ -251,7 +255,7 @@ const TH = {
 
     const warns = [];
     if (s.status === 'offline') warns.push('الاتصال بالسيرفر مقطوع. تعديلاتك محفوظة وراح ترتفع من يرجع الاتصال. تأكد من Radmin VPN.');
-    if (s.raw_geometry > 0) warns.push(`أكو ${s.raw_geometry} خط/سطح مو داخل Group، وهذني ما يوصلون للفريق. حطهم داخل Group أو Component.`);
+    if (s.raw_geometry > 2000) warns.push(`أكو ${s.raw_geometry} خط/سطح سايب. يتزامنون، بس ككتلة وحدة، فإذا اثنين رسموا خطوط سايبة بنفس اللحظة يمشي تعديل آخر واحد. للشغل المتوازي سووها Group.`);
     if (s.me && s.me.role === 'viewer') warns.push('حسابك مشاهدة فقط.');
     $('#warnings').innerHTML = warns.map((w) => `<div class="warn">${esc(w)}</div>`).join('');
 
@@ -363,11 +367,12 @@ $('#chat-form').addEventListener('submit', (ev) => {
 });
 
 document.addEventListener('click', (ev) => {
-  const el = ev.target.closest('[data-act],[data-connect],[data-focus],[data-reserve],[data-release],[data-tab],[data-f]');
+  const el = ev.target.closest('[data-act],[data-connect],[data-download],[data-focus],[data-reserve],[data-release],[data-tab],[data-f]');
   if (!el) return;
   const d = el.dataset;
   if (d.act) act(d.act);
   else if (d.connect) act('connect', { project_id: Number(d.connect), mode: d.mode });
+  else if (d.download) act('download_file', { project_id: Number(d.download) });
   else if (d.focus) act('focus', { oid: d.focus });
   else if (d.reserve) act('reserve_oid', { oid: d.reserve });
   else if (d.release) act('release_oid', { oid: d.release });
