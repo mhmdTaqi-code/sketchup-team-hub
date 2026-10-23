@@ -38,7 +38,7 @@ module TeamHub
   class Session
     POLL_INTERVAL = 1.0
     SWEEP_INTERVAL = 3.0 # full check of every object for local changes
-    SCAN_DELAY = 0.8
+    SCAN_DELAY = 0.3
     MAX_PARALLEL_PUSHES = 4
     IDENTITY = Geom::Transformation.new
 
@@ -98,7 +98,7 @@ module TeamHub
     end
     # Everyone edits everything; a reservation is optional and only blocks others.
     def mine?(oid)
-      !viewer? && (@locks[oid].nil? || @locks[oid] == my_id)
+      !viewer? && (@locks[oid].nil? || @locks[oid] == my_id) && !claimed_by_other?(oid)
     end
     def reserved_by_me?(oid)
       @locks[oid] == my_id
@@ -134,6 +134,8 @@ module TeamHub
       @stopped = true
       UI.stop_timer(@poll_timer) if @poll_timer
       UI.stop_timer(@sweep_timer) if @sweep_timer
+      UI.stop_timer(@tick_timer) if @tick_timer
+      @poll_gen = (@poll_gen || 0) + 1
       UI.stop_timer(@scan_timer) if @scan_timer
       UI.stop_timer(@idle_timer) if @idle_timer
       @poll_timer = @scan_timer = @idle_timer = nil
@@ -199,43 +201,7 @@ module TeamHub
 
     # ------------------------------------------------------------ polling
 
-    def start_polling
-      UI.stop_timer(@poll_timer) if @poll_timer
-      @poll_timer = UI.start_timer(POLL_INTERVAL, true) { guard { poll } }
-      UI.stop_timer(@sweep_timer) if @sweep_timer
-      @sweep_timer = UI.start_timer(SWEEP_INTERVAL, true) { guard { request_sweep } }
-      poll
-    end
-
-    def poll
-      return if @polling || @stopped
-      @polling = true
-      path = "/api/projects/#{pid}/events?since=#{@seq}&limit=500&client=sketchup" \
-             "&su=#{Client.q(TeamHub.su_version_label)}&pv=#{Client.q(PLUGIN_VERSION)}"
-      text = status_text
-      path += "&status=#{Client.q(text)}" if text
-      @client.request(:get, path, nil, timeout: 20) do |st, data|
-        @polling = false
-        next if @stopped
-        if st == 200 && data
-          was_offline = !connected?
-          @status = :online
-          @online = data['online'] if data['online']
-          data['events'].each { |e| handle_event(e) }
-          refresh_overlay if !@recent.empty? || data['events'].any?
-          poll if data['events'].size >= data['limit'].to_i
-          if was_offline
-            when_idle { pump_pushes }
-            run_jobs
-          end
-        elsif st == 401
-          TeamHub.auth_expired
-        else
-          @status = :offline
-        end
-        notify
-      end
-    end
+    # start_polling / poll: long-poll loop, see realtime.rb
 
     def status_text
       root = (@model.active_path || []).first
@@ -256,13 +222,18 @@ module TeamHub
       case e['type']
       when 'object'
         oid = p['oid']
+        prev = @objects[oid]
         @objects[oid] = p
         unless p['updated_by'] == my_id # my own upload coming back
           @recent[oid] = [p['updated_by'], Time.now] unless p['kind'] == 'definition'
           if p['deleted']
             enqueue(p) if local_exists?(p)
           elsif local_rev(p) < p['rev']
-            enqueue(p)
+            # Same contents as the copy I already have (a move/rotate/rename):
+            # just update it in place, nothing to download.
+            same = prev && p['kind'] == 'group' && p['blob'] && prev['blob'] == p['blob'] &&
+                   local_rev(p) == prev['rev'].to_i
+            enqueue(same ? p.merge('meta_only' => true) : p)
           end
         end
       when 'lock'
@@ -276,6 +247,12 @@ module TeamHub
           names = lost.map { |o| object_label(o) }.first(3).join('، ')
           TeamHub.flash("انفك حجزك على: #{names}")
         end
+        when_idle { apply_local_locks(p['oids']) }
+      when 'claim'
+        p['oids'].each { |o| claims[o] = p['user_id'] }
+        when_idle { apply_local_locks(p['oids']) } unless p['user_id'] == my_id
+      when 'unclaim'
+        p['oids'].each { |o| claims.delete(o) }
         when_idle { apply_local_locks(p['oids']) }
       when 'chat'
         TeamHub.chat_received(e) unless u && u['id'] == my_id
@@ -381,12 +358,16 @@ module TeamHub
           @def_dirty[did] = true
         end
         @touched[oid] = true
+        note_activity(oid)
       end
       mark_loose_dirty if root.nil?
       # Moves, rotations, paint etc. on top-level objects act on the selection.
-      @model.selection.each do |e|
+      sel = @model.selection.to_a
+      sel.each do |e|
         o = @eid_to_oid[e.entityID]
-        @touched[o] = true if o
+        next unless o
+        @touched[o] = true
+        note_activity(o) if sel.size <= 30
       end
       schedule_scan
     end
@@ -431,7 +412,13 @@ module TeamHub
       oid = @eid_to_oid[root.entityID]
       return unless oid
       @touched[oid] = true
-      blocked = reserved_by_other?(oid) ? oid : nil
+      blocked = (reserved_by_other?(oid) || claimed_by_other?(oid)) ? oid : nil
+      unless blocked
+        note_activity(oid) do |holder|
+          UI.start_timer(0, false) { @model.close_active rescue nil }
+          TeamHub.flash("#{holder['display_name'] || 'عضو ثاني'} دا يعدّل على «#{display_name(root)}» هسه. انتظر يخلص.")
+        end
+      end
       if !blocked && root.is_a?(Sketchup::ComponentInstance)
         did = root.definition.get_attribute(DICT, 'did')
         blocked = "d_#{did}" if did && reserved_by_other?("d_#{did}")
@@ -519,7 +506,20 @@ module TeamHub
       @touched.clear
       candidates.each do |oid|
         ent = live_entity(oid)
-        next unless ent && mine?(oid)
+        next unless ent
+        unless mine?(oid)
+          # Changed here while someone else is on it (their claim arrived
+          # late, or it was forced): never drop my version — keep it as a copy.
+          next if viewer?
+          changed = (@meta_fp.key?(oid) && @meta_fp[oid] != meta_fp(ent)) ||
+                    (@content_fp.key?(oid) && @content_fp[oid] != content_fp(ent))
+          if changed
+            holder = @users[claims[oid] || @locks[oid]]
+            keep_both(oid, holder)
+            snapshot_fp(oid)
+          end
+          next
+        end
         if ent.is_a?(Sketchup::ComponentInstance)
           did = ent.definition.get_attribute(DICT, 'did')
           if did.nil? || (live_def(did) && live_def(did) != ent.definition)
@@ -645,7 +645,7 @@ module TeamHub
     end
 
     def meta_fp(ent)
-      t = ent.transformation.to_a.map { |v| v.round(6) }
+      t = t_of(ent, @eid_to_oid[ent.entityID]).map { |v| v.round(6) }
       did = ent.is_a?(Sketchup::ComponentInstance) ? ent.definition.get_attribute(DICT, 'did') : nil
       [t, ent.name, ent.layer.name, ent.material&.name, ent.hidden?, did]
     end
@@ -716,7 +716,7 @@ module TeamHub
           end
         end
         kind = ent.is_a?(Sketchup::Group) ? 'group' : 'component'
-        meta = { 't' => ent.transformation.to_a, 'material' => ent.material&.name, 'hidden' => ent.hidden?,
+        meta = { 't' => t_of(ent, oid), 'material' => ent.material&.name, 'hidden' => ent.hidden?,
                  'iname' => ent.name.to_s }
         if kind == 'component'
           meta['def'] = ent.definition.get_attribute(DICT, 'did')
@@ -730,7 +730,7 @@ module TeamHub
         fp = content_fp(ent)
         mfp = meta_fp(ent)
       end
-      body['base_rev'] = server['rev'] if server && !server['deleted']
+      body['base_rev'] = local_rev('oid' => oid, 'kind' => oid.start_with?('d_') ? 'definition' : 'object') if server && !server['deleted']
 
       @pushing[oid] = true
       notify
@@ -768,7 +768,12 @@ module TeamHub
           release_all
           TeamHub.flash('انرفع الملف للمشروع. الفريق يكدر يحجز ويشتغل هسه.')
         end
-      when 423
+      when 423, 409
+        if st == 409 || (data && data['error'] == 'being_edited')
+          @new_local.delete(oid)
+          keep_both(oid, data && data['user'])
+          return
+        end
         @new_local.delete(oid)
         @release_after.delete(oid)
         holder = data && data['user']
@@ -777,11 +782,6 @@ module TeamHub
         server = @objects[oid]
         enqueue(server.merge('force' => true)) if server && !server['deleted']
         when_idle { apply_local_locks([oid]) }
-      when 409
-        # Our base revision is stale but we still hold the reservation:
-        # our copy is the newest, so retry on top of the server's revision.
-        @objects[oid] = (@objects[oid] || {}).merge('rev' => data['rev'], 'deleted' => false) if data
-        request_push(oid, content)
       when 401
         TeamHub.auth_expired
       when 0
@@ -846,7 +846,7 @@ module TeamHub
           done.call
         end
       end
-      if obj['deleted'] || obj['kind'] == 'component'
+      if obj['deleted'] || obj['kind'] == 'component' || (obj['meta_only'] && live_entity(obj['oid']))
         apply.call(nil)
         return
       end
@@ -875,7 +875,7 @@ module TeamHub
       # A newer revision exists (often my own edit that won): this one is stale.
       return if latest && latest['rev'].to_i > obj['rev'].to_i
       return if latest && latest['updated_by'] == my_id && !obj['force'] && local_exists?(obj)
-      if editing_now?(oid) || @pushing[oid] || @push_wanted.key?(oid)
+      if editing_now?(oid) || @pushing[oid] || @push_wanted.key?(oid) || @touched[oid] || @content_dirty[oid]
         # I'm in the middle of it: let me finish; whoever saves last wins.
         UI.start_timer(2, false) { enqueue(obj) unless @stopped }
         return
@@ -883,7 +883,7 @@ module TeamHub
       model_op('Team Hub: تحديث من الفريق') do
         case obj['kind']
         when 'definition' then apply_definition(obj, path)
-        when 'group' then apply_group(obj, path)
+        when 'group' then obj['meta_only'] && live_entity(oid) ? apply_group_meta(obj) : apply_group(obj, path)
         when 'loose' then apply_loose(obj, path)
         else apply_component(obj)
         end
@@ -932,6 +932,17 @@ module TeamHub
       newdef.description = meta['description'].to_s
       newdef.set_attribute(DICT, 'did', did)
       newdef.set_attribute(DICT, 'rev', obj['rev'])
+    end
+
+    # A teammate only moved / renamed / repainted it: change it in place.
+    def apply_group_meta(obj)
+      ent = live_entity(obj['oid'])
+      meta = obj['meta'] || {}
+      t = meta['t']
+      was = ent.locked?
+      ent.locked = false if was
+      ent.transformation = Geom::Transformation.new(t) if t.is_a?(Array) && t.size == 16
+      finish_entity(ent, obj, ent)
     end
 
     def apply_group(obj, path)
@@ -1251,11 +1262,16 @@ module TeamHub
         name = uid == my_id ? 'محجوز إلك' : "محجوز: #{(@users[uid] || {})['display_name'] || '؟'}"
         items << [e, color_of(uid), name, uid == my_id]
       end
+      claims.each do |oid, uid|
+        next if uid == my_id || @locks[oid]
+        e = live_entity(oid)
+        items << [e, color_of(uid), "✎ #{(@users[uid] || {})['display_name'] || '؟'} يعدّل", false] if e
+      end
       now = Time.now
       @recent.delete_if { |_, (_, at)| now - at > 8 }
       @recent.each do |oid, (uid, _)|
         e = live_entity(oid)
-        next unless e && !@locks[oid]
+        next unless e && !@locks[oid] && !claims[oid]
         items << [e, color_of(uid), "✎ #{(@users[uid] || {})['display_name'] || '؟'}", false]
       end
       changed = items.map { |e, *_| e.entityID } != (@overlay_items || []).map { |e, *_| e.valid? ? e.entityID : 0 }
@@ -1305,6 +1321,8 @@ module TeamHub
         downloads: @jobs.size + (@job_running ? 1 : 0),
         uploads: @push_wanted.size + @pushing.size,
         raw_geometry: @raw_count,
+        ping: @ping_ms,
+        editing_by_others: claims.count { |_, uid| uid != my_id },
         events: @events.last(80),
         last_error: @last_error,
       }

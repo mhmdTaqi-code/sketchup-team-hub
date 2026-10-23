@@ -381,13 +381,33 @@ function broadcast(pid, msg) {
 }
 
 // Persisted, ordered event. Clients replay these by seq after reconnecting.
+// Long-poll waiters: SketchUp clients park a request until something happens.
+const waiters = new Map(); // pid -> Set<() => void>
+
+function wakeWaiters(pid) {
+  const set = waiters.get(pid);
+  if (!set || !set.size) return;
+  waiters.delete(pid);
+  for (const fn of set) fn();
+}
+
+function waitForEvent(pid, ms) {
+  return new Promise((resolve) => {
+    let set = waiters.get(pid);
+    if (!set) { set = new Set(); waiters.set(pid, set); }
+    const done = () => { clearTimeout(timer); set.delete(done); resolve(); };
+    const timer = setTimeout(done, ms);
+    set.add(done);
+  });
+}
+
 function emit(pid, type, payload, userId) {
   const seq = q.bumpSeq.get(pid).seq;
   const at = now();
   q.insertEvent.run(pid, seq, type, JSON.stringify(payload), userId ?? null, at);
   const msg = { type, seq, payload, user: userId ? userBrief(userId) : null, at };
   // Broadcast after the surrounding transaction has committed.
-  setImmediate(() => broadcast(pid, msg));
+  setImmediate(() => { broadcast(pid, msg); wakeWaiters(pid); });
   return seq;
 }
 
@@ -395,7 +415,7 @@ function liveConnections(pid) {
   const t = now();
   const out = [];
   for (const c of clients.values()) if (c.pid === pid) out.push(c);
-  for (const p of pollers.values()) if (p.pid === pid && t - p.at < POLL_ONLINE_MS) out.push(p);
+  for (const p of pollers.values()) if (p.pid === pid && (t - p.at < POLL_ONLINE_MS || p.pending > 0)) out.push(p);
   return out;
 }
 
@@ -407,6 +427,7 @@ function onlineList(pid) {
     if (c.status) cur.status = c.status;
     // e.g. { su: "SketchUp 2025", plugin: "1.1.0" } — shown next to the member.
     if (c.app) cur.apps.push(c.app);
+    if (c.app && Number.isFinite(c.app.ping)) cur.ping = c.app.ping;
     byUser.set(c.user.id, cur);
   }
   return [...byUser.values()];
@@ -425,8 +446,9 @@ function touchPoller(pid, user, client, statusText, app) {
   const prev = pollers.get(key);
   const status = statusText ? { text: String(statusText).slice(0, 120), oid: null } : null;
   const fresh = !prev || now() - prev.at >= POLL_ONLINE_MS;
-  const changed = fresh || (prev.status?.text || null) !== (status?.text || null) || prev.app?.su !== app?.su;
-  pollers.set(key, { user, pid, client, status, app, at: now() });
+  const changed = fresh || (prev.status?.text || null) !== (status?.text || null) || prev.app?.su !== app?.su ||
+    Math.abs((prev.app?.ping ?? 0) - (app?.ping ?? 0)) > 40;
+  pollers.set(key, { user, pid, client, status, app: app || prev?.app || null, at: now(), pending: prev?.pending || 0 });
   offlineSince.delete(`${pid}:${user.id}`);
   if (changed) broadcastPresence(pid);
 }
@@ -435,7 +457,7 @@ function touchPoller(pid, user, client, statusText, app) {
 setInterval(() => {
   const t = now();
   for (const [key, p] of pollers) {
-    if (t - p.at < POLL_ONLINE_MS) continue;
+    if (t - p.at < POLL_ONLINE_MS || p.pending > 0) continue; // parked long-poll = still online
     pollers.delete(key);
     if (!isOnline(p.pid, p.user.id)) offlineSince.set(`${p.pid}:${p.user.id}`, p.at);
     broadcastPresence(p.pid);
@@ -494,6 +516,46 @@ function releaseLocks(pid, user, oids, { force = false, reason = 'release' } = {
   return { released, denied };
 }
 
+// ---------------------------------------------------------------- live edit claims
+//
+// While someone is working on an object it is "claimed" by them for a few
+// seconds (renewed while they keep working). Everyone else sees it as
+// "being edited by X" and can't change it meanwhile, so nobody's work is
+// overwritten. Claims expire by themselves if a client disappears.
+
+const CLAIM_MS = 15_000;
+const claims = new Map(); // `${pid}:${oid}` -> { user_id, until }
+
+function claimOf(pid, oid) {
+  const c = claims.get(`${pid}:${oid}`);
+  if (!c) return null;
+  if (c.until < now()) { claims.delete(`${pid}:${oid}`); return null; }
+  return c;
+}
+
+function claimList(pid) {
+  const out = [];
+  const t = now();
+  for (const [key, c] of claims) {
+    const [p, oid] = [Number(key.slice(0, key.indexOf(':'))), key.slice(key.indexOf(':') + 1)];
+    if (p === pid && c.until >= t) out.push({ oid, user_id: c.user_id, until: c.until });
+  }
+  return out;
+}
+
+setInterval(() => {
+  const t = now();
+  const expired = new Map();
+  for (const [key, c] of claims) {
+    if (c.until >= t) continue;
+    claims.delete(key);
+    const pid = Number(key.slice(0, key.indexOf(':')));
+    if (!expired.has(pid)) expired.set(pid, []);
+    expired.get(pid).push(key.slice(key.indexOf(':') + 1));
+  }
+  for (const [pid, oids] of expired) tx(() => emit(pid, 'unclaim', { oids, reason: 'expired' }, null));
+}, 3_000).unref();
+
 function writeObject(pid, user, oid, body) {
   if (!/^[A-Za-z0-9_-]{6,64}$/.test(oid)) throw httpError(400, 'invalid_oid');
   return tx(() => {
@@ -504,6 +566,16 @@ function writeObject(pid, user, oid, body) {
     // Without one, the last write wins.
     if (lock && lock.user_id !== user.id) {
       throw httpError(423, 'locked_by_other', { user: userBrief(lock.user_id) });
+    }
+    const claim = claimOf(pid, oid);
+    if (claim && claim.user_id !== user.id) {
+      throw httpError(423, 'being_edited', { user: userBrief(claim.user_id) });
+    }
+    // Conflict guard: my copy was based on an older revision that someone
+    // else has changed since. Refuse, so the client keeps both versions
+    // instead of silently erasing theirs.
+    if (live && body.base_rev != null && Number(body.base_rev) < obj.rev && obj.updated_by !== user.id) {
+      throw httpError(409, 'conflict', { rev: obj.rev, user: userBrief(obj.updated_by) });
     }
     let blob = obj ? obj.blob : null;
     let size = obj ? obj.size : null;
@@ -540,6 +612,10 @@ function deleteObject(pid, user, oid, baseRev) {
     const lock = q.lock.get(pid, oid);
     if (lock && lock.user_id !== user.id) {
       throw httpError(423, 'locked_by_other', { user: userBrief(lock.user_id) });
+    }
+    const claim = claimOf(pid, oid);
+    if (claim && claim.user_id !== user.id) {
+      throw httpError(423, 'being_edited', { user: userBrief(claim.user_id) });
     }
     if (!obj) {
       // Never changed since the shared file was handed out: record the deletion
@@ -763,6 +839,54 @@ route('PATCH', '/api/projects/:pid', async (ctx) => {
   return { project: q.project.get(p.id) };
 });
 
+route('GET', '/api/ping', () => ({ t: now() }));
+
+// Claim objects I'm working on (and release the ones I'm done with).
+route('POST', '/api/projects/:pid/claim', async (ctx) => {
+  requireRole(ctx.user, 'admin', 'editor');
+  const p = getProject(ctx.params.pid);
+  const b = await readJson(ctx.req);
+  const oids = (Array.isArray(b.oids) ? b.oids : []).map(String).slice(0, 200);
+  const release = (Array.isArray(b.release) ? b.release : []).map(String).slice(0, 2000);
+  const granted = [];
+  const denied = [];
+  const fresh = [];
+  const t = now();
+  for (const oid of oids) {
+    const lock = q.lock.get(p.id, oid);
+    const c = claimOf(p.id, oid);
+    const blocker = (lock && lock.user_id !== ctx.user.id) ? lock.user_id : (c && c.user_id !== ctx.user.id) ? c.user_id : null;
+    if (blocker) { denied.push({ oid, user: userBrief(blocker) }); continue; }
+    if (!c) fresh.push(oid);
+    claims.set(`${p.id}:${oid}`, { user_id: ctx.user.id, until: t + CLAIM_MS });
+    granted.push(oid);
+  }
+  const released = [];
+  for (const oid of release) {
+    const c = claimOf(p.id, oid);
+    if (c && c.user_id === ctx.user.id) { claims.delete(`${p.id}:${oid}`); released.push(oid); }
+  }
+  if (fresh.length || released.length) {
+    tx(() => {
+      if (fresh.length) emit(p.id, 'claim', { oids: fresh, user_id: ctx.user.id }, ctx.user.id);
+      if (released.length) emit(p.id, 'unclaim', { oids: released, reason: 'done' }, ctx.user.id);
+    });
+  }
+  return { granted, denied, released, ttl_ms: CLAIM_MS };
+});
+
+// Status + ping without waiting for the long-poll to return.
+route('POST', '/api/projects/:pid/presence', async (ctx) => {
+  requireRole(ctx.user, 'admin', 'editor', 'viewer');
+  const p = getProject(ctx.params.pid);
+  const b = await readJson(ctx.req);
+  const client = String(b.client || 'sketchup').slice(0, 20);
+  const app = { su: String(b.su || '').slice(0, 40), plugin: String(b.plugin || '').slice(0, 20),
+    ping: b.ping != null ? Number(b.ping) : undefined };
+  touchPoller(p.id, ctx.user, client, b.status || null, app);
+  return { ok: true, online: onlineList(p.id) };
+});
+
 route('GET', '/api/projects/:pid/state', (ctx) => {
   requireRole(ctx.user, 'admin', 'editor', 'viewer');
   const p = getProject(ctx.params.pid);
@@ -770,24 +894,38 @@ route('GET', '/api/projects/:pid/state', (ctx) => {
     project: { id: p.id, name: p.name },
     seq: p.seq,
     objects: q.objects.all(p.id).map(serializeObject),
+    claims: claimList(p.id),
     locks: q.locks.all(p.id),
     online: onlineList(p.id),
     users: q.users.all().map(publicUser),
   };
 });
 
-route('GET', '/api/projects/:pid/events', (ctx) => {
+route('GET', '/api/projects/:pid/events', async (ctx) => {
   requireRole(ctx.user, 'admin', 'editor', 'viewer');
   const p = getProject(ctx.params.pid);
   const since = ctx.url.searchParams.get('since');
   const limit = Math.min(Number(ctx.url.searchParams.get('limit')) || 500, 5000);
   const client = ctx.url.searchParams.get('client');
+  const sp = ctx.url.searchParams;
+  const clientKey = client ? `${p.id}:${ctx.user.id}:${String(client).slice(0, 20)}` : null;
   if (client) {
-    const sp = ctx.url.searchParams;
-    const app = sp.get('su') ? { su: String(sp.get('su')).slice(0, 40), plugin: String(sp.get('pv') || '').slice(0, 20) } : null;
+    const app = sp.get('su') ? { su: String(sp.get('su')).slice(0, 40), plugin: String(sp.get('pv') || '').slice(0, 20),
+      ping: sp.get('ping') != null ? Number(sp.get('ping')) : undefined } : null;
     touchPoller(p.id, ctx.user, String(client).slice(0, 20), sp.get('status'), app);
   }
-  const rows = since != null ? q.eventsSince.all(p.id, Number(since), limit) : q.eventsRecent.all(p.id, limit).reverse();
+  let rows = since != null ? q.eventsSince.all(p.id, Number(since), limit) : q.eventsRecent.all(p.id, limit).reverse();
+  // Long-poll: nothing new yet → hold the request until something happens (real-time push).
+  const wait = Math.min(Number(sp.get('wait')) || 0, 25);
+  if (!rows.length && since != null && wait > 0) {
+    const pl = clientKey && pollers.get(clientKey);
+    if (pl) pl.pending = (pl.pending || 0) + 1;
+    try { await waitForEvent(p.id, wait * 1000); } finally {
+      const pl2 = clientKey && pollers.get(clientKey);
+      if (pl2) { pl2.pending = Math.max(0, (pl2.pending || 1) - 1); pl2.at = now(); }
+    }
+    rows = q.eventsSince.all(p.id, Number(since), limit);
+  }
   const cache = new Map();
   const brief = (id) => {
     if (id == null) return null;
@@ -795,8 +933,9 @@ route('GET', '/api/projects/:pid/events', (ctx) => {
     return cache.get(id);
   };
   return {
-    seq: p.seq,
+    seq: q.project.get(p.id).seq,
     limit,
+    claims: client ? claimList(p.id) : undefined,
     online: client ? onlineList(p.id) : undefined,
     events: rows.map((e) => ({ type: e.type, seq: e.seq, payload: JSON.parse(e.payload), user: brief(e.user_id), at: e.created_at })),
   };

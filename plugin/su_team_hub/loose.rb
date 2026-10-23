@@ -47,6 +47,7 @@ module TeamHub
 
     def baseline_loose
       @loose_base = loose_fp
+      remember_loose_ids
     end
 
     def scan_loose
@@ -55,6 +56,7 @@ module TeamHub
       return if viewer? || reserved_by_other?(LOOSE_OID)
       fp = loose_fp
       return if fp == @loose_base
+      note_activity(LOOSE_OID)
       request_push(LOOSE_OID, true)
     end
 
@@ -62,6 +64,7 @@ module TeamHub
       list = loose_entities
       fp = loose_fp
       body = { 'kind' => 'loose', 'name' => 'خطوط وسطوح سائبة', 'layer' => '', 'meta' => { 'empty' => list.empty? } }
+      body['base_rev'] = loose_rev if @objects[LOOSE_OID] && !@objects[LOOSE_OID]['deleted']
       body['data'] = list.empty? ? ['EMPTY'].pack('m0') : export_loose
       @pushing[LOOSE_OID] = true
       notify
@@ -71,11 +74,14 @@ module TeamHub
         if st == 200 && data
           @objects[LOOSE_OID] = data['object']
           @loose_base = fp
+          remember_loose_ids
           rev = data['object']['rev']
           when_idle { model_op('Team Hub') { @model.set_attribute(DICT, 'loose_rev', rev) } }
         elsif st.zero?
           @status = :offline
           @push_wanted[LOOSE_OID] = true
+        elsif st == 409 || (st == 423 && data && data['error'] == 'being_edited')
+          when_idle { keep_both(LOOSE_OID, data && data['user']) } # my new lines become my own Group
         elsif st == 423
           TeamHub.flash('الخطوط السائبة محجوزة من عضو ثاني')
         end
@@ -113,6 +119,7 @@ module TeamHub
       end
       @model.set_attribute(DICT, 'loose_rev', obj['rev'])
       @loose_base = loose_fp
+      remember_loose_ids
     end
 
     def editing_loose_now?

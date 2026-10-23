@@ -245,7 +245,8 @@ const TH = {
 
   appLabel(u) {
     const apps = u.apps || [];
-    if (apps.length) return apps.map((a) => esc(a.su)).join('، ');
+    const ping = u.ping != null ? ` · 📶 ${u.ping}ms` : '';
+    if (apps.length) return apps.map((a) => esc(a.su)).join('، ') + ping;
     return u.clients.includes('sketchup') ? 'SketchUp' : 'متصفح';
   },
 
@@ -284,7 +285,11 @@ const TH = {
       st.className = 'syncstate busy';
       st.textContent = [s.uploads ? `⇪ يرفع ${s.uploads}` : '', s.downloads ? `⇩ ينزّل ${s.downloads}` : ''].filter(Boolean).join(' · ') + '…';
     } else if (!s.loaded) { st.className = 'syncstate busy'; st.textContent = 'يتصل…'; }
-    else { st.className = 'syncstate'; st.textContent = '✓ متزامن · يفحص كل 3 ثواني'; }
+    else { st.className = 'syncstate'; st.textContent = '⚡ لايف · متزامن'; }
+    const ping = s.ping != null ? ` · 📶 ${s.ping} ms` : '';
+    st.textContent += ping;
+    if (s.editing_by_others) parts.push(`<span>✎ ${s.editing_by_others} عنصر يعدّلون عليه هسه</span>`);
+    $('#stats').innerHTML = parts.join('');
 
     const warns = [];
     if (s.status === 'offline') warns.push('تأكد إن Radmin VPN شغال عند الاثنين.');
