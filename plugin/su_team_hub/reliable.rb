@@ -22,6 +22,67 @@ module TeamHub
     nil
   end
 
+  # What the plugin is doing right now. If SketchUp dies, this is left
+  # behind and the next start writes it to the log ("where did it crash?").
+  CRUMB_PATH = File.join(File.dirname(LOG_PATH), 'sketchup_step.txt')
+
+  def self.crumb(step)
+    File.write(CRUMB_PATH, "#{Time.now.strftime('%Y-%m-%d %H:%M:%S.%L')} #{step}")
+  rescue StandardError
+    nil
+  end
+
+  def self.check_previous_crash
+    return unless File.exist?(CRUMB_PATH)
+    last = File.read(CRUMB_PATH).to_s
+    if last =~ / (idle|exit)\z/
+      log_sync("START plugin #{PLUGIN_VERSION} (last run ended normally or crashed outside Team Hub: #{last})")
+    else
+      log_sync("START plugin #{PLUGIN_VERSION} — PREVIOUS RUN DIED INSIDE TEAM HUB: #{last}")
+    end
+    crumb('idle')
+  rescue StandardError
+    nil
+  end
+
+  # Wraps the plugin's heavy steps with a crumb.
+  module Crumbs
+    def push_now(oid, *rest)
+      TeamHub.crumb("push #{oid}")
+      super
+    ensure
+      TeamHub.crumb('idle')
+    end
+
+    def apply_object(obj, *rest)
+      TeamHub.crumb("apply #{obj['oid']} #{obj['kind']} r#{obj['rev']}")
+      super
+    ensure
+      TeamHub.crumb('idle')
+    end
+
+    def scan
+      TeamHub.crumb('scan')
+      super
+    ensure
+      TeamHub.crumb('idle')
+    end
+
+    def heal_step
+      TeamHub.crumb('heal')
+      super
+    ensure
+      TeamHub.crumb('idle')
+    end
+
+    def baseline_all
+      TeamHub.crumb('baseline')
+      super
+    ensure
+      TeamHub.crumb('idle')
+    end
+  end
+
   def self.send_log
     text = File.exist?(LOG_PATH) ? File.read(LOG_PATH, encoding: 'UTF-8') : ''
     text = text[-2_000_000..] if text.size > 2_000_000
@@ -247,4 +308,5 @@ module TeamHub
       end
     end
   end
+  Session.prepend(Crumbs)
 end

@@ -86,7 +86,7 @@ module TeamHub
 
       def tick
         return if @stage.negative?
-        if since > 90
+        if since > (@role == 'R' ? 600 : 90)
           log("TIMEOUT at stage #{@stage}")
           @stage = -1
           return
@@ -94,6 +94,7 @@ module TeamHub
         case @role
         when 'A' then step_a
         when 'P' then step_p
+        when 'R' then step_r
         else step_b
         end
       rescue StandardError => e
@@ -240,8 +241,7 @@ module TeamHub
           end
           return if Time.now - @c_open < 5 # uploads happen while the component is still open
           model.active_path = nil
-          inst('C1').definition.invalidate_bounds
-          post("A:cbb=#{inst('C1').definition.bounds.min.to_a.map { |v| v.to_f.round(2) }.inspect}")
+          post("A:cbb=#{TeamHub.session.contents_bounds(inst('C1').definition).min.to_a.map { |v| v.to_f.round(2) }.inspect}")
           model.selection.clear
           post('A:drew_c')
           nxt('drew inside the component (through C1)')
@@ -337,6 +337,58 @@ module TeamHub
         end
       end
 
+      # ------------------------------------------------------------ bot R (a real big file: find a crash)
+      # Every plugin step is written (and flushed) to trace.txt before it runs,
+      # so if SketchUp dies the last line says where.
+      def trace(msg)
+        File.open(@cfg['trace'], 'a') { |f| f.puts("#{Time.now.strftime('%H:%M:%S.%L')} #{msg}"); f.flush }
+      end
+
+      def install_trace
+        me = self
+        %i[scan scan_at_root heal_step request_sweep baseline_all apply_object push_now pump_pushes process_added
+           process_removed live_tick run_jobs export_definition load_definition apply_definition apply_group
+           apply_loose push_loose export_loose apply_local_locks refresh_overlay tick_claims scan_loose
+           remove_definitions link_nested_definitions after_undo_reconcile].each do |name|
+          next unless TeamHub::Session.method_defined?(name) || TeamHub::Session.private_method_defined?(name)
+          orig = TeamHub::Session.instance_method(name)
+          TeamHub::Session.send(:define_method, name) do |*args, &blk|
+            me.trace(">#{name} #{args.first.is_a?(Hash) ? args.first['oid'] : args.first.class}")
+            r = orig.bind(self).call(*args, &blk)
+            me.trace("<#{name}")
+            r
+          end
+        end
+      end
+
+      def step_r
+        case @stage
+        when 0
+          install_trace
+          TeamHub.login(@cfg['server'], @cfg['user'], @cfg['pass'])
+          nxt('login sent')
+        when 1
+          return unless TeamHub.logged_in? && TeamHub.me
+          trace("model #{model.title} defs=#{model.definitions.size} top=#{model.entities.size}")
+          if @cfg['mode'] == 'resume'
+            TeamHub.auto_connect(model) # what happens when the user reopens the file
+            nxt('resume (auto connect) requested')
+          else
+            TeamHub.load_projects { TeamHub.share_file }
+            nxt('share requested')
+          end
+        when 2
+          trace("alive stage2 connected=#{connected?}") if (since * 10).to_i % 20 == 0
+          return unless connected?
+          nxt("connected; idling 90 s with sweeps running")
+        when 3
+          trace('alive') if (since * 10).to_i % 20 == 0
+          return if since < 80
+          log('DONE (no crash in 80 s)')
+          @stage = -1
+        end
+      end
+
       # ------------------------------------------------------------ bot B (downloads and joins)
       def step_b
         case @stage
@@ -407,8 +459,7 @@ module TeamHub
           check(arrived, "A's drawing in the component reached B #{ms_since('A:drew_c')} ms after A drew it (faces #{d.entities.grep(Sketchup::Face).size}, copies #{d.instances.size})")
           k = bus.keys.find { |x| x.start_with?('A:cbb=') }
           return unless k || ms_since('A:drew_c') > 8000
-          inst('C1').definition.invalidate_bounds
-          mine_bb = inst('C1').definition.bounds.min.to_a.map { |v| v.to_f.round(2) }.inspect
+          mine_bb = TeamHub.session.contents_bounds(inst('C1').definition).min.to_a.map { |v| v.to_f.round(2) }.inspect
           check(k && k.sub('A:cbb=', '') == mine_bb, "component contents at the same x/y/z on B (A #{k && k.sub('A:cbb=', '')}, B #{mine_bb})")
           check(origin(inst('C1')) == [2000.0, 0.0, 0.0] && origin(inst('C2')) == [3000.0, 500.0, 0.0], "component copies stayed in place on B (C1 #{origin(inst('C1')).inspect}, C2 #{origin(inst('C2')).inspect})")
           post('B:comp_ok')

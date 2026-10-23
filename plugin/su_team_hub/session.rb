@@ -554,14 +554,13 @@ module TeamHub
     # undo the edit transform; if it is open further up the path we can't be
     # sure, so send no box (the receiver then doesn't align).
     def local_bbox(defn)
-      fresh_bounds(defn)
       path = @model.active_path || []
       idx = path.index { |e| e.respond_to?(:definition) && e.definition == defn }
-      return bbox_a(defn.bounds) if idx.nil?
+      return bbox_a(contents_bounds(defn)) if idx.nil?
       return nil unless idx == path.size - 1
       inv = @model.edit_transform.inverse
       bb = Geom::BoundingBox.new
-      b = defn.bounds
+      b = contents_bounds(defn)
       return nil if b.empty?
       (0..7).each { |i| bb.add(b.corner(i).transform(inv)) }
       bbox_a(bb)
@@ -819,7 +818,6 @@ module TeamHub
     # geometry hash of a big model every 3 s froze SketchUp ("Not Responding").
     # Real edits are reported by the observers; this only catches the rest.
     def defn_fp(d)
-      fresh_bounds(d)
       b = d.bounds
       [d.entities.length, b.min.to_a.map { |v| v.round(5) }, b.max.to_a.map { |v| v.round(5) }]
     end
@@ -1487,10 +1485,14 @@ module TeamHub
 
     # The sender told us where the contents sit (box min/max in x, y, z). If the
     # loaded copy sits anywhere else, move it back exactly; then double-check.
-    def fresh_bounds(defn)
-      defn.invalidate_bounds if defn.respond_to?(:invalidate_bounds)
-    rescue StandardError
-      nil
+    # The real box of a definition's contents, read from the entities
+    # themselves: ComponentDefinition#bounds can lag behind a change, and
+    # forcing it (invalidate_bounds) while the user is mid-tool crashed
+    # SketchUp. Reading is always safe.
+    def contents_bounds(defn)
+      bb = Geom::BoundingBox.new
+      defn.entities.each { |e| bb.add(e.bounds) if e.respond_to?(:bounds) }
+      bb
     end
 
     def align_definition(defn, meta, placements = [])
@@ -1501,8 +1503,7 @@ module TeamHub
       end
       return unless expect_bb.is_a?(Array) && expect_bb.size == 2
       return unless expect_bb.all? { |p| p.is_a?(Array) && p.size == 3 && p.all? { |v| v.is_a?(Numeric) && v.to_f.finite? } }
-      fresh_bounds(defn)
-      have = defn.bounds
+      have = contents_bounds(defn)
       return if have.empty?
       want_min = Geom::Point3d.new(*expect_bb[0])
       delta = want_min - have.min
@@ -1518,10 +1519,9 @@ module TeamHub
           return
         end
         defn.entities.transform_entities(Geom::Transformation.translation(delta), defn.entities.to_a)
-        fresh_bounds(defn) # SketchUp keeps the old box until asked
         TeamHub.log_sync("ALIGN #{defn.name}: contents were off by #{delta.to_a.map { |v| v.to_f.round(3) }.inspect}, moved back")
       end
-      got = bbox_a(defn.bounds)
+      got = bbox_a(contents_bounds(defn))
       ok = got && got.flatten.zip(expect_bb.flatten).all? { |a, b| (a - b).abs < 0.001 }
       TeamHub.log_sync("VERIFY #{defn.name} box #{ok ? 'OK' : "MISMATCH have #{got.inspect} want #{expect_bb.inspect}"}")
     end

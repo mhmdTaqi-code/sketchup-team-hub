@@ -419,10 +419,12 @@ module TeamHub
 
     def onQuit
       TeamHub.stop_session
+      TeamHub.crumb('exit')
     end
   end
 
   unless file_loaded?(__FILE__)
+    check_previous_crash
     setup_ui
     Sketchup.add_observer(AppObs.new)
     file_loaded(__FILE__)
