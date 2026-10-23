@@ -39,6 +39,8 @@ module TeamHub
       ws_ping
       catch_up # anything that happened before the socket was up
       resend_inflight_deltas
+      when_idle { pump_pushes }
+      run_jobs
       notify
     end
 
@@ -61,6 +63,12 @@ module TeamHub
         notify
       when 'pong'
         @ping_ms = ((Time.now.to_f * 1000) - m['t'].to_f).round if m['t']
+        if !connected?
+          @status = :online
+          when_idle { pump_pushes }
+          run_jobs
+        end
+        catch_up if m['seq'].to_i > @seq
       when 'ack'
         delta_acked(m)
       else
@@ -82,14 +90,27 @@ module TeamHub
     def catch_up
       return if @catching || @stopped
       @catching = true
-      @client.request(:get, "/api/projects/#{pid}/events?since=#{@seq}&limit=5000", nil, timeout: 30) do |st, data|
+      @client.request(:get, "/api/projects/#{pid}/events?since=#{@seq}&limit=5000&client=sketchup", nil, timeout: 30) do |st, data|
         @catching = false
         next if @stopped
         if st == 200 && data
+          set_claims(data['claims']) if data['claims']
           data['events'].each { |e| handle_event(e) }
           buf = (@ws_buffer || []).sort_by { |e| e['seq'].to_i }
           @ws_buffer = []
-          buf.each { |e| handle_event(e) if e['seq'].to_i > @seq }
+          buf.each do |e|
+            next if e['seq'].to_i <= @seq
+            if e['seq'].to_i == @seq + 1
+              handle_event(e)
+            else
+              @ws_buffer << e
+            end
+          end
+          # A page is capped at 5,000 events. Never jump over the next page to
+          # replay a newer WS event, even when the socket buffer is nonempty.
+          if data['seq'].to_i > @seq || !@ws_buffer.empty?
+            UI.start_timer(0, false) { guard { catch_up } }
+          end
           refresh_overlay
           notify
         else

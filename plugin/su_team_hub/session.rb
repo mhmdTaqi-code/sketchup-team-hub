@@ -170,6 +170,7 @@ module TeamHub
           data['locks'].each { |l| @locks[l['oid']] = l['user_id'] }
           data['users'].each { |u| @users[u['id']] = u }
           @online = data['online'] || []
+          set_claims(data['claims']) if data['claims']
           @objects = {}
           data['objects'].each { |o| @objects[o['oid']] = o }
           @status = :online
@@ -193,10 +194,17 @@ module TeamHub
           @model.entities.clear!
           @model.definitions.purge_unused
           @model.materials.purge_unused
+          @model.set_attribute(DICT, 'loose_rev', 0)
         end
       end
       rebuild_index
       baseline_all
+      if @mode == :upload && !viewer?
+        @index.each_key { |oid| @new_local[oid] = true; @content_dirty[oid] = true }
+        @def_index.each_key { |did| @def_dirty[did] = true }
+        @loose_base = nil
+        @loose_dirty = true
+      end
       ensure_tracking(LOOSE_OID)
       reconcile_with_server
       @raw_count = count_raw_geometry
@@ -220,7 +228,6 @@ module TeamHub
     def handle_event(e)
       seq = e['seq'].to_i
       return if seq <= @seq
-      @seq = seq
       u = e['user']
       @users[u['id']] = u if u
       p = e['payload'] || {}
@@ -273,16 +280,28 @@ module TeamHub
       end
       @events << e
       @events.shift while @events.size > 150
+      @seq = seq
     end
 
     # ------------------------------------------------------------ index
 
     def trackable?(e)
-      (e.is_a?(Sketchup::Group) || e.is_a?(Sketchup::ComponentInstance)) && e.valid?
+      (e.is_a?(Sketchup::Group) || e.is_a?(Sketchup::ComponentInstance)) && entity_valid?(e)
+    end
+
+    def entity_valid?(e)
+      e && e.valid? && !e.deleted?
+    rescue StandardError
+      false
+    end
+
+    # Never invoke SketchUp's equality/hash methods on a deleted Ruby wrapper.
+    def same_entity?(a, b)
+      entity_valid?(a) && entity_valid?(b) && a.entityID == b.entityID
     end
 
     def top_level?(e)
-      e.parent == @model
+      entity_valid?(e) && e.parent == @model
     rescue StandardError
       false
     end
@@ -292,6 +311,7 @@ module TeamHub
       @eid_to_oid.clear
       @def_index.clear
       @model.definitions.each do |d|
+        next unless entity_valid?(d)
         next if d.group? || d.image?
         did = d.get_attribute(DICT, 'did')
         @def_index[did] ||= d if did
@@ -308,19 +328,21 @@ module TeamHub
     end
 
     def index_entity(e)
+      return unless trackable?(e)
       oid = e.get_attribute(DICT, 'oid')
+      @eid_to_oid.delete_if { |eid, o| o == oid && eid != e.entityID }
       @index[oid] = e
       @eid_to_oid[e.entityID] = oid
     end
 
     def live_entity(oid)
       e = @index[oid]
-      e && e.valid? ? e : nil
+      entity_valid?(e) ? e : nil
     end
 
     def live_def(did)
       d = did && @def_index[did]
-      d && d.valid? ? d : nil
+      entity_valid?(d) ? d : nil
     end
 
     def did_of(oid)
@@ -328,12 +350,15 @@ module TeamHub
     end
 
     def local_exists?(obj)
-      return true if obj['oid'] == LOOSE_OID
+      if obj['oid'] == LOOSE_OID
+        return !loose_entities.empty? || loose_rev < obj['rev'].to_i if obj['deleted']
+        return (obj['meta'] || {})['empty'] || !loose_entities.empty?
+      end
       obj['kind'] == 'definition' ? !live_def(did_of(obj['oid'])).nil? : !live_entity(obj['oid']).nil?
     end
 
     def local_rev(obj)
-      return loose_rev if obj['oid'] == LOOSE_OID
+      return local_exists?(obj) ? loose_rev : -1 if obj['oid'] == LOOSE_OID
       holder = obj['kind'] == 'definition' ? live_def(did_of(obj['oid'])) : live_entity(obj['oid'])
       # No revision on the entity = it is as it was in the shared file (rev 0).
       holder ? holder.get_attribute(DICT, 'rev', 0).to_i : -1
@@ -347,7 +372,7 @@ module TeamHub
       (defs + rest).each do |o|
         if o['deleted']
           enqueue(o) if local_exists?(o)
-        elsif local_rev(o) < o['rev'].to_i
+        elsif !local_exists?(o) || local_rev(o) < o['rev'].to_i
           enqueue(o.merge('force' => true))
         end
       end
@@ -355,9 +380,11 @@ module TeamHub
 
     # Remember how every object looks now, so later scans only push real changes.
     def baseline_all
-      @index.each_key { |oid| snapshot_fp(oid) }
-      @def_index.each_key { |did| snapshot_fp("d_#{did}") }
-      baseline_loose
+      with_root_coordinates do
+        @index.each_key { |oid| guard { snapshot_fp(oid) } }
+        @def_index.each_key { |did| guard { snapshot_fp("d_#{did}") } }
+        guard { baseline_loose }
+      end
     end
 
     # ------------------------------------------------------------ observers
@@ -366,7 +393,7 @@ module TeamHub
       return if @suspended.positive? || !@loaded
       flush_deltas(send: true)
       root = (@model.active_path || []).first
-      if root && (oid = @eid_to_oid[root.entityID])
+      if trackable?(root) && (oid = @eid_to_oid[root.entityID])
         if root.is_a?(Sketchup::Group)
           @content_dirty[oid] = true
         elsif (did = root.definition.get_attribute(DICT, 'did'))
@@ -379,6 +406,7 @@ module TeamHub
       # Moves, rotations, paint etc. on top-level objects act on the selection.
       sel = @model.selection.to_a
       sel.each do |e|
+        next unless entity_valid?(e)
         o = @eid_to_oid[e.entityID]
         next unless o
         @touched[o] = true
@@ -389,6 +417,7 @@ module TeamHub
 
     def on_modified(e)
       return if @suspended.positive? || !@loaded
+      return unless entity_valid?(e)
       o = @eid_to_oid[e.entityID]
       return unless o
       @touched[o] = true
@@ -424,7 +453,7 @@ module TeamHub
     def on_active_path
       return if @suspended.positive? || !@loaded
       root = (@model.active_path || []).first
-      return unless root
+      return unless trackable?(root)
       oid = @eid_to_oid[root.entityID]
       return unless oid
       @touched[oid] = true
@@ -475,17 +504,69 @@ module TeamHub
       end
     end
 
-    def model_op(name)
+    def suspend_sync
+      @suspended_since ||= Time.now
       @suspended += 1
-      @model.start_operation(name, true, false, true)
-      ok = false
       begin
         yield
-        ok = true
       ensure
-        ok ? @model.commit_operation : @model.abort_operation
-        @suspended -= 1
+        @suspended = [@suspended - 1, 0].max
+        @suspended_since = nil if @suspended.zero?
       end
+    end
+
+    def model_op(name, rollback: true)
+      suspend_sync do
+        started = false
+        @operation_depth = (@operation_depth || 0) + 1
+        begin
+          # Incoming replacements need their own transaction: aborting a
+          # transparent operation also aborts the user's preceding operation.
+          started = @model.start_operation(name, true, false, !rollback)
+          raise 'Team Hub could not start operation' unless started
+          result = yield
+          raise 'Team Hub could not commit operation' unless @model.commit_operation
+          started = false
+          result
+        rescue StandardError
+          begin
+            @model.abort_operation if started
+          rescue StandardError => abort_error
+            TeamHub.log_error(abort_error)
+          end
+          raise
+        ensure
+          @operation_depth -= 1
+        end
+      end
+    end
+
+    # Never take the user out of the group/component they are editing: the
+    # few readings that depend on the edit context convert their coordinates
+    # instead (see local_bbox), and whatever can't be read correctly while
+    # inside waits until the user leaves (object_sighash, loose export).
+    def with_root_coordinates
+      yield
+    end
+
+    # The contents' box in the definition's own coordinates. While this
+    # definition is open for editing SketchUp reports it in model space, so
+    # undo the edit transform; if it is open further up the path we can't be
+    # sure, so send no box (the receiver then doesn't align).
+    def local_bbox(defn)
+      fresh_bounds(defn)
+      path = @model.active_path || []
+      idx = path.index { |e| e.respond_to?(:definition) && e.definition == defn }
+      return bbox_a(defn.bounds) if idx.nil?
+      return nil unless idx == path.size - 1
+      inv = @model.edit_transform.inverse
+      bb = Geom::BoundingBox.new
+      b = defn.bounds
+      return nil if b.empty?
+      (0..7).each { |i| bb.add(b.corner(i).transform(inv)) }
+      bbox_a(bb)
+    rescue StandardError
+      nil
     end
 
     def guard
@@ -509,6 +590,10 @@ module TeamHub
 
     def scan
       return unless @loaded && !@stopped
+      with_root_coordinates { scan_at_root }
+    end
+
+    def scan_at_root
       process_removed
       if @after_undo
         @after_undo = false
@@ -520,71 +605,92 @@ module TeamHub
       # Only objects that may have changed: the one being edited, the selection,
       # anything SketchUp reported as modified, and new ones.
       candidates = @touched.keys | @new_local.keys | @content_dirty.keys
-      @touched.clear
       candidates.each do |oid|
-        ent = live_entity(oid)
-        next unless ent
-        unless mine?(oid)
-          # Changed here while someone else is on it (their claim arrived
-          # late, or it was forced): never drop my version — keep it as a copy.
-          next if viewer?
-          changed = (@meta_fp.key?(oid) && @meta_fp[oid] != meta_fp(ent)) ||
-                    (@content_fp.key?(oid) && @content_fp[oid] != content_fp(ent))
-          if changed
-            holder = @users[@locks[oid] || claims[oid]] || {}
-            TeamHub.log_sync("REVERT #{oid} changed while #{holder['display_name']} has it")
-            TeamHub.flash("«#{display_name(ent)}» يعدّل عليه #{holder['display_name'] || 'عضو ثاني'} هسه، فرجّعته مثل ما جان. انتظر يخلص.")
-            server = @objects[oid]
-            enqueue(server.merge('force' => true)) if server && !server['deleted']
-            snapshot_fp(oid)
+        begin
+          @touched.delete(oid)
+          ent = live_entity(oid)
+          unless ent
+            @content_dirty.delete(oid)
+            @new_local.delete(oid)
+            next
           end
-          next
-        end
-        if ent.is_a?(Sketchup::ComponentInstance)
-          did = ent.definition.get_attribute(DICT, 'did')
-          if did.nil? || (live_def(did) && live_def(did) != ent.definition)
-            model_op('Team Hub') { ensure_did(ent.definition) } # after "Make Unique"
+          unless mine?(oid)
+            # Changed here while someone else is on it (their claim arrived
+            # late, or it was forced): never drop my version — keep it as a copy.
+            next if viewer?
+            changed = (@meta_fp.key?(oid) && @meta_fp[oid] != meta_fp(ent)) ||
+                      (@content_fp.key?(oid) && @content_fp[oid] != content_fp(ent))
+            if changed
+              holder = @users[@locks[oid] || claims[oid]] || {}
+              TeamHub.log_sync("REVERT #{oid} changed while #{holder['display_name']} has it")
+              TeamHub.flash("«#{display_name(ent)}» يعدّل عليه #{holder['display_name'] || 'عضو ثاني'} هسه، فرجّعته مثل ما جان. انتظر يخلص.")
+              server = @objects[oid]
+              enqueue(server.merge('force' => true)) if server && !server['deleted']
+              snapshot_fp(oid)
+            end
+            @content_dirty.delete(oid) if !changed || @objects[oid]
+            next
           end
+          if ent.is_a?(Sketchup::ComponentInstance)
+            did = ent.definition.get_attribute(DICT, 'did')
+            unless same_entity?(live_def(did), ent.definition)
+              model_op('Team Hub') { ensure_did(ent.definition) } # after "Make Unique"
+            end
+            @def_dirty[ent.definition.get_attribute(DICT, 'did')] = true if @new_local[oid]
+          end
+          mfp = meta_fp(ent)
+          cfp = content_fp(ent)
+          content = @content_dirty.delete(oid) || @new_local[oid] ||
+                    (@content_fp.key?(oid) && @content_fp[oid] != cfp)
+          # A component copy has no contents of its own: drawing inside it changes
+          # the shared definition (sent as deltas / definition checkpoint), not
+          # the copy — so don't re-send its position for that.
+          if content && ent.is_a?(Sketchup::ComponentInstance) && !@new_local[oid]
+            @content_fp[oid] = cfp
+            content = false
+          end
+          if content && delta_live?(oid) && editing_now?(oid) &&
+             Time.now - ((@last_cp ||= {})[oid] || Time.at(0)) < CHECKPOINT_EVERY
+            @content_dirty[oid] = true # deltas carry it live; full copy later
+            content = false
+          end
+          next unless content || !@meta_fp.key?(oid) || @meta_fp[oid] != mfp
+          (@last_cp ||= {})[oid] = Time.now if content
+          request_push(oid, content ? true : false)
+        rescue StandardError => e
+          @touched[oid] = true
+          @last_error = e.message
+          TeamHub.log_error(e)
         end
-        mfp = meta_fp(ent)
-        cfp = content_fp(ent)
-        content = @content_dirty.delete(oid) || @new_local[oid] ||
-                  (@content_fp.key?(oid) && @content_fp[oid] != cfp)
-        # A component copy has no contents of its own: drawing inside it changes
-        # the shared definition (sent as deltas / definition checkpoint), not
-        # the copy — so don't re-send its position for that.
-        if content && ent.is_a?(Sketchup::ComponentInstance) && !@new_local[oid]
-          @content_fp[oid] = cfp
-          content = false
-        end
-        if content && delta_live?(oid) && editing_now?(oid) &&
-           Time.now - ((@last_cp ||= {})[oid] || Time.at(0)) < CHECKPOINT_EVERY
-          @content_dirty[oid] = true # deltas carry it live; full copy later
-          content = false
-        end
-        next unless content || !@meta_fp.key?(oid) || @meta_fp[oid] != mfp
-        (@last_cp ||= {})[oid] = Time.now if content
-        request_push(oid, content ? true : false)
       end
 
       @def_dirty.keys.each do |did|
-        d = live_def(did)
-        d_oid = "d_#{did}"
-        open_here = d && ctx_of_root((@model.active_path || []).first) == d_oid
-        if d && delta_live?(d_oid) && open_here &&
-           Time.now - ((@last_cp ||= {})[d_oid] || Time.at(0)) < CHECKPOINT_EVERY
-          next # deltas carry it live; full definition copy later
-        end
-        @def_dirty.delete(did)
-        next unless d
-        if mine?(d_oid)
-          (@last_cp ||= {})[d_oid] = Time.now
-          request_push(d_oid, true)
-        else
-          holder = @users[@locks[d_oid]] || {}
-          TeamHub.flash("تعريف «#{d.name}» محجوز من #{holder['display_name'] || 'عضو ثاني'}، فتعديلك داخله ما يوصل. رجّعت النسخة الأصلية.")
-          server = @objects[d_oid]
-          enqueue(server.merge('force' => true)) if server && !server['deleted']
+        begin
+          d = live_def(did)
+          d_oid = "d_#{did}"
+          open_here = d && ctx_of_root((@model.active_path || []).first) == d_oid
+          if d && delta_live?(d_oid) && open_here &&
+             Time.now - ((@last_cp ||= {})[d_oid] || Time.at(0)) < CHECKPOINT_EVERY
+            next # deltas carry it live; full definition copy later
+          end
+          unless d
+            @def_dirty.delete(did)
+            next
+          end
+          if mine?(d_oid)
+            (@last_cp ||= {})[d_oid] = Time.now
+            request_push(d_oid, true)
+            @def_dirty.delete(did)
+          else
+            holder = @users[@locks[d_oid]] || {}
+            TeamHub.flash("تعريف «#{d.name}» محجوز من #{holder['display_name'] || 'عضو ثاني'}، فتعديلك داخله ما يوصل. رجّعت النسخة الأصلية.")
+            server = @objects[d_oid]
+            enqueue(server.merge('force' => true)) if server && !server['deleted']
+            @def_dirty.delete(did)
+          end
+        rescue StandardError => e
+          @last_error = e.message
+          TeamHub.log_error(e)
         end
       end
 
@@ -601,9 +707,9 @@ module TeamHub
         oid = @eid_to_oid[eid]
         next unless oid
         ent = @index[oid]
-        next if ent && ent.valid? && ent.entityID != eid
+        next if entity_valid?(ent) && ent.entityID != eid
         @eid_to_oid.delete(eid)
-        @index.delete(oid) if ent.nil? || !ent.valid?
+        @index.delete(oid) unless entity_valid?(ent)
         @push_wanted.delete(oid)
         @content_dirty.delete(oid)
         next if @new_local.delete(oid) && @objects[oid].nil?
@@ -634,9 +740,15 @@ module TeamHub
           end
         elsif local_exists?(o)
           if local_rev(o) < o['rev'].to_i
-            mine_last ? (@content_dirty[oid] = true) : enqueue(o.merge('force' => true))
+            if mine_last
+              o['kind'] == 'definition' ? (@def_dirty[did_of(oid)] = true) : (@content_dirty[oid] = true)
+            else
+              enqueue(o.merge('force' => true))
+            end
           end
-        elsif o['kind'] != 'definition'
+        elsif o['kind'] == 'definition'
+          enqueue(o.merge('force' => true))
+        else
           mine_last && mine?(oid) ? push_delete(oid) : enqueue(o.merge('force' => true))
         end
       end
@@ -644,42 +756,52 @@ module TeamHub
     end
 
     def process_added
-      list = @added.uniq.select { |e| trackable?(e) && top_level?(e) }
+      list = @added.select { |e| trackable?(e) && top_level?(e) }.uniq { |e| e.entityID }
       @added.clear
       return if list.empty? || viewer?
-      model_op('Team Hub: عنصر جديد') do
-        list.each do |e|
-          oid = e.get_attribute(DICT, 'oid')
-          other = oid && @index[oid]
-          if oid.nil? || (other && other != e && other.valid?)
-            oid = "o#{SecureRandom.hex(10)}"
-            e.set_attribute(DICT, 'oid', oid)
+      list.each do |e|
+        begin
+          model_op('Team Hub: عنصر جديد') do
+            oid = e.get_attribute(DICT, 'oid')
+            other = oid && live_entity(oid)
+            next if same_entity?(other, e) && (@meta_fp.key?(oid) || @new_local[oid] || @content_dirty[oid])
+            if oid.nil? || (other && !same_entity?(other, e))
+              oid = "o#{SecureRandom.hex(10)}"
+              e.set_attribute(DICT, 'oid', oid)
+            end
+            e.delete_attribute(DICT, 'rev')
+            e.locked = false if e.locked?
+            ensure_did(e.definition) if e.is_a?(Sketchup::ComponentInstance)
+            index_entity(e)
+            server = @objects[oid]
+            if server.nil? || server['deleted']
+              @new_local[oid] = true
+            elsif !mine?(oid)
+              # An existing object came back (e.g. undo) but it isn't mine.
+              enqueue(server.merge('force' => true))
+              next
+            end
+            @content_dirty[oid] = true
           end
-          e.delete_attribute(DICT, 'rev')
-          e.locked = false if e.locked?
-          ensure_did(e.definition) if e.is_a?(Sketchup::ComponentInstance)
-          index_entity(e)
-          server = @objects[oid]
-          if server.nil? || server['deleted']
-            @new_local[oid] = true
-          elsif !mine?(oid)
-            # An existing object came back (e.g. undo) but it isn't mine.
-            enqueue(server.merge('force' => true))
-            next
-          end
-          @content_dirty[oid] = true
+        rescue StandardError => error
+          @last_error = error.message
+          TeamHub.log_error(error)
+          guard { rebuild_index }
+          @added << e if trackable?(e) && top_level?(e)
         end
       end
     end
 
     def ensure_did(defn)
+      raise 'Team Hub definition was deleted' unless entity_valid?(defn)
       did = defn.get_attribute(DICT, 'did')
-      if did.nil? || (live_def(did) && live_def(did) != defn)
+      if did.nil? || (live_def(did) && !same_entity?(live_def(did), defn))
         did = SecureRandom.hex(10)
         defn.set_attribute(DICT, 'did', did)
         defn.delete_attribute(DICT, 'rev')
       end
       @def_index[did] = defn
+      @def_dirty[did] = true unless @objects["d_#{did}"] && !@objects["d_#{did}"]['deleted']
       did
     end
 
@@ -695,7 +817,8 @@ module TeamHub
 
     def defn_fp(d)
       b = d.bounds
-      [d.entities.length, b.min.to_a.map { |v| v.round(5) }, b.max.to_a.map { |v| v.round(5) }]
+      [d.entities.length, b.min.to_a.map { |v| v.round(5) }, b.max.to_a.map { |v| v.round(5) },
+       sighash_of_entities(d.entities, {}, true)]
     end
 
     def snapshot_fp(oid)
@@ -721,8 +844,18 @@ module TeamHub
         # send everything in one go (memory + a long UI freeze).
         break if @pushing.size >= MAX_PARALLEL_PUSHES
         next if @pushing[oid]
+        next unless mine?(oid)
+        next if (@push_retry_at ||= {})[oid] && Time.now < @push_retry_at[oid]
         content = @push_wanted.delete(oid)
-        push_now(oid, content)
+        begin
+          with_root_coordinates { push_now(oid, content) }
+        rescue StandardError => e
+          @pushing.delete(oid)
+          @push_wanted[oid] = (@push_wanted[oid] || false) || content
+          @push_retry_at[oid] = Time.now + 5
+          @last_error = e.message
+          TeamHub.log_error(e)
+        end
       end
     end
 
@@ -734,7 +867,7 @@ module TeamHub
         server = @objects[oid]
         body = {
           'kind' => 'definition', 'name' => d.name, 'layer' => '',
-          'meta' => { 'name' => d.name, 'description' => d.description, 'bb' => bbox_a(d.bounds) },
+          'meta' => { 'name' => d.name, 'description' => d.description, 'bb' => local_bbox(d), 'bb_space' => 'local' },
           'data' => export_definition(d),
         }
         fp = defn_fp(d)
@@ -745,7 +878,7 @@ module TeamHub
         server = @objects[oid]
         if ent.is_a?(Sketchup::ComponentInstance)
           did = ent.definition.get_attribute(DICT, 'did')
-          return request_push(oid, content) if did.nil?
+          did = ensure_did(ent.definition) if did.nil?
           d_oid = "d_#{did}"
           if @objects[d_oid].nil? || @objects[d_oid]['deleted']
             # The definition goes first; this instance follows when it lands.
@@ -763,7 +896,10 @@ module TeamHub
         end
         # 'name' is the label everyone sees; meta.iname is the entity's own name.
         body = { 'kind' => kind, 'name' => display_name(ent), 'layer' => ent.layer.name, 'meta' => meta }
-        meta['bb'] = bbox_a(ent.definition.bounds) if kind == 'group'
+        if kind == 'group'
+          meta['bb'] = local_bbox(ent.definition)
+          meta['bb_space'] = 'local' if meta['bb']
+        end
         if kind == 'group' && (content || server.nil? || server['deleted'] || server['blob'].nil?)
           body['data'] = export_definition(ent.definition)
         end
@@ -781,9 +917,17 @@ module TeamHub
       @client.request(:post, "/api/projects/#{pid}/objects/#{oid}", body, timeout: 600) do |st, data|
         @pushing.delete(oid)
         next if @stopped
-        handle_push_result(oid, st, data, content, mfp, fp)
-        when_idle { pump_pushes }
-        notify
+        begin
+          handle_push_result(oid, st, data, content, mfp, fp)
+        rescue StandardError => e
+          @push_wanted[oid] = (@push_wanted[oid] || false) || content
+          @push_retry_at[oid] = Time.now + 5
+          @last_error = e.message
+          TeamHub.log_error(e)
+        ensure
+          when_idle { pump_pushes }
+          notify
+        end
       end
     end
 
@@ -791,7 +935,8 @@ module TeamHub
       case st
       when 200
         obj = data['object']
-        @objects[oid] = obj
+        latest = @objects[oid]
+        @objects[oid] = obj unless latest && latest['rev'].to_i > obj['rev'].to_i
         TeamHub.log_sync("PUSHED #{oid} → r#{obj['rev']}")
         @new_local.delete(oid)
         @meta_fp[oid] = mfp if mfp
@@ -804,7 +949,11 @@ module TeamHub
           # My copy now is that revision: remember it in the model, so reopening
           # the file doesn't download my own change again.
           rev = obj['rev']
-          when_idle { model_op('Team Hub') { holder.set_attribute(DICT, 'rev', rev) if holder.valid? } }
+          when_idle do
+            model_op('Team Hub') do
+              holder.set_attribute(DICT, 'rev', rev) if entity_valid?(holder) && holder.get_attribute(DICT, 'rev', 0).to_i < rev.to_i
+            end
+          end
           send_unlock([oid]) if @release_after.delete(oid) && !@push_wanted.key?(oid)
         end
         if @mode == :upload && @push_wanted.empty? && @pushing.empty? && @new_local.empty?
@@ -818,21 +967,25 @@ module TeamHub
           lost_race(oid, data)
           return
         end
-        @new_local.delete(oid)
+        @new_local.delete(oid) if @objects[oid]
         @release_after.delete(oid)
         holder = data && data['user']
         holder ? @locks[oid] = holder['id'] : @locks.delete(oid)
         TeamHub.flash("ما انرفع تعديلك على «#{object_label(oid)}»: #{holder ? "محجوز من #{holder['display_name']}" : 'مو محجوز إلك'}. رجّعت نسخة الفريق.")
         server = @objects[oid]
         enqueue(server.merge('force' => true)) if server && !server['deleted']
+        @push_wanted[oid] = true unless server
         when_idle { apply_local_locks([oid]) }
       when 401
         TeamHub.auth_expired
       when 0
         @status = :offline
         @push_wanted[oid] = (@push_wanted[oid] || false) || content
+        (@push_retry_at ||= {})[oid] = Time.now + 5
       else
         @last_error = "upload #{st}: #{data && data['error']}"
+        @push_wanted[oid] = (@push_wanted[oid] || false) || content
+        (@push_retry_at ||= {})[oid] = Time.now + 10
         TeamHub.flash("خطأ برفع «#{object_label(oid)}»: #{data && data['error']}")
       end
     end
@@ -840,11 +993,18 @@ module TeamHub
     def push_delete(oid)
       server = @objects[oid]
       return if server && server['deleted']
+      @deleting ||= {}
+      return if @deleting[oid]
+      @deleting[oid] = true
       @client.request(:delete, "/api/projects/#{pid}/objects/#{oid}") do |st, data|
+        @deleting.delete(oid)
         next if @stopped
         case st
         when 200
-          @objects[oid] = data['object'] if data && data['object'].is_a?(Hash) && data['object']['oid']
+          if data && data['object'].is_a?(Hash) && data['object']['oid']
+            o = data['object']
+            @objects[oid] = o if @objects[oid].nil? || @objects[oid]['rev'].to_i <= o['rev'].to_i
+          end
           @locks.delete(oid)
         when 0
           @delete_wanted[oid] = true
@@ -852,7 +1012,7 @@ module TeamHub
         else
           holder = data && data['user']
           TeamHub.flash("ما انحذف «#{object_label(oid)}»: #{holder ? "محجوز من #{holder['display_name']}" : data && data['error']}. رجّعته.")
-          enqueue(server.merge('force' => true)) if server
+          enqueue(server.merge('force' => true, '_refresh' => true)) if server
         end
         notify
       end
@@ -870,53 +1030,137 @@ module TeamHub
     # ------------------------------------------------------------ pull & apply
 
     def enqueue(obj)
+      queued = @jobs.find { |j| j['oid'] == obj['oid'] }
+      return if queued && queued['rev'].to_i > obj['rev'].to_i
+      if queued && queued['rev'].to_i == obj['rev'].to_i
+        obj = queued.merge(obj)
+        obj['force'] = true if queued['force']
+        obj.delete('meta_only') if queued['force'] || obj['force']
+      end
       @jobs.reject! { |j| j['oid'] == obj['oid'] }
-      @jobs << obj
+      @jobs << obj.dup
       run_jobs
+    end
+
+    def defer_job(obj, delay)
+      enqueue(obj.merge('_ready_at' => Time.now + delay))
+    end
+
+    def retry_job(obj, error)
+      @last_error = error.message
+      TeamHub.log_error(error)
+      tries = obj['_attempt'].to_i + 1
+      if tries <= 3
+        TeamHub.log_sync("RETRY #{obj['oid']} r#{obj['rev']} attempt #{tries}/3: #{error.message}")
+        defer_job(obj.merge('_attempt' => tries), 2 ** (tries - 1))
+      else
+        # Drop meta-only shortcuts and the cached file. Keep retrying at a slow
+        # rate after the bounded fast retries; a failed revision is never done.
+        TeamHub.log_sync("RETRY FULL #{obj['oid']} r#{obj['rev']}: #{error.message}")
+        fresh = obj.merge('force' => true, '_redownload' => true, '_refresh' => true, '_attempt' => 0)
+        fresh.delete('meta_only')
+        defer_job(fresh, 30)
+      end
+    end
+
+    # The conflict response contains a revision but no full object. Refresh the
+    # descriptor using the existing state endpoint (also repairs missing deps).
+    def refresh_for_job(obj, &done)
+      @client.request(:get, "/api/projects/#{pid}/state", nil, timeout: 60) do |st, data|
+        begin
+          raise "refresh #{obj['oid']}: HTTP #{st}" unless st == 200 && data && data['objects']
+          data['objects'].each do |o|
+            prev = @objects[o['oid']]
+            @objects[o['oid']] = o if prev.nil? || prev['rev'].to_i <= o['rev'].to_i
+          end
+          fresh = @objects[obj['oid']] || obj
+          fresh = fresh.merge('force' => true, '_redownload' => true)
+          fresh.delete('_refresh')
+          defer_job(fresh, 0)
+        rescue StandardError => e
+          retry_job(obj, e)
+        ensure
+          done.call
+        end
+      end
     end
 
     def run_jobs
       return if @job_running || @jobs.empty? || @stopped
-      obj = @jobs.shift
+      ready = @jobs.index { |j| j['_ready_at'].nil? || j['_ready_at'] <= Time.now }
+      unless ready
+        unless @job_timer
+          delay = [@jobs.map { |j| j['_ready_at'] }.min - Time.now, 0.1].max
+          @job_timer = UI.start_timer(delay, false) do
+            @job_timer = nil
+            guard { run_jobs }
+          end
+        end
+        return
+      end
+      obj = @jobs.delete_at(ready)
       @job_running = true
+      @running_job = obj
       done = lambda do
         @job_running = false
-        notify
+        @running_job = nil
         UI.start_timer(0, false) { guard { run_jobs } }
+        notify
       end
+      return refresh_for_job(obj, &done) if obj['_refresh']
       if obj['kind'] == 'delta'
         when_idle do
-          guard { apply_delta(obj) }
-          done.call
+          begin
+            apply_delta(obj)
+          rescue StandardError => e
+            retry_job(obj, e)
+          ensure
+            done.call
+          end
         end
         return
       end
       apply = lambda do |path|
         when_idle do
-          guard { apply_object(obj, path) }
-          done.call
+          begin
+            apply_object(obj, path)
+          rescue StandardError => e
+            # Ruby indices aren't part of SketchUp's undo transaction. Rebuild
+            # them after abort so retries never see wrappers from the rollback.
+            guard { rebuild_index }
+            retry_job(obj, e)
+          ensure
+            done.call
+          end
         end
       end
-      if obj['deleted'] || obj['kind'] == 'component' || (obj['meta_only'] && live_entity(obj['oid']))
+      if obj['deleted'] || obj['kind'] == 'component' || (obj['meta_only'] && live_entity(obj['oid'])) ||
+         (obj['kind'] == 'loose' && (obj['meta'] || {})['empty'])
         apply.call(nil)
         return
       end
       cache = File.join(@temp, 'blobs', "#{obj['blob']}.skp")
-      return apply.call(cache) if File.exist?(cache)
+      raise "Missing blob for #{obj['oid']}" if obj['blob'].nil?
+      return apply.call(cache) if File.exist?(cache) && !obj['_redownload']
 
       @client.request(:get, "/api/blobs/#{obj['blob']}?b64=1", nil, timeout: 600) do |st, data|
-        next if @stopped
-        if st == 200 && data && data['data']
+        if @stopped
+          done.call
+          next
+        end
+        begin
+          raise "download #{obj['oid']}: HTTP #{st}" unless st == 200 && data && data['data']
           File.binwrite(cache, data['data'].unpack1('m0'))
           apply.call(cache)
-        else
+        rescue StandardError => e
           @status = :offline if st.zero?
-          @jobs.unshift(obj) unless @jobs.any? { |j| j['oid'] == obj['oid'] }
-          @job_running = false
-          UI.start_timer(5, false) { guard { run_jobs } }
-          notify
+          retry_job(obj, e)
+          done.call
         end
       end
+    rescue StandardError => e
+      retry_job(obj, e) if obj
+      done.call if done
     end
 
     def apply_object(obj, path)
@@ -924,36 +1168,59 @@ module TeamHub
       oid = obj['oid']
       latest = @objects[oid]
       # A newer revision exists (often my own edit that won): this one is stale.
-      return if latest && latest['rev'].to_i > obj['rev'].to_i
-      return if latest && latest['updated_by'] == my_id && !obj['force'] && local_exists?(obj)
-      if editing_now?(oid) || @pushing[oid] || @push_wanted.key?(oid) || @touched[oid] || @content_dirty[oid] ||
-         (obj['kind'] == 'loose' && !(@model.active_path || []).empty?) || placement_unsafe?(obj)
-        # I'm in the middle of it (or inside a Group, where loose geometry
-        # would land in the wrong place): apply a moment later.
-        UI.start_timer(2, false) { enqueue(obj) unless @stopped }
+      if latest && latest['rev'].to_i > obj['rev'].to_i
+        needed = latest['deleted'] ? local_exists?(latest) : local_rev(latest) < latest['rev'].to_i
+        enqueue(latest.merge('force' => true)) if needed
         return
       end
-      flush_deltas(send: true)
-      ctx = ctx_for_object(obj)
-      untrack(ctx) if ctx && !obj['meta_only']
-      TeamHub.log_sync("APPLY #{oid} #{obj['kind']} r#{obj['rev']}#{obj['meta_only'] ? ' position' : ''}#{obj['deleted'] ? ' DELETE' : ''} from u#{obj['updated_by']}")
-      model_op('Team Hub: تحديث من الفريق') do
-        case obj['kind']
-        when 'definition' then apply_definition(obj, path)
-        when 'group' then obj['meta_only'] && live_entity(oid) ? apply_group_meta(obj) : apply_group(obj, path)
-        when 'loose' then apply_loose(obj, path)
-        else apply_component(obj)
+      return if latest && latest['updated_by'] == my_id && !obj['force'] && local_rev(obj) >= obj['rev'].to_i
+      # A queued local upload cannot wait on somebody else's claim while also
+      # blocking that person's incoming version indefinitely.
+      @push_wanted.delete(oid) if !mine?(oid) && !@pushing[oid]
+      if editing_now?(oid) || @pushing[oid] || @push_wanted.key?(oid) ||
+         (!obj['force'] && (@touched[oid] || @content_dirty[oid])) || placement_unsafe?(obj)
+        # I'm in the middle of it (or inside a Group, where loose geometry
+        # would land in the wrong place): apply a moment later.
+        defer_job(obj, 2)
+        return
+      end
+      if obj['kind'] == 'component' && !obj['deleted'] && !live_def((obj['meta'] || {})['def'])
+        dep = @objects["d_#{(obj['meta'] || {})['def']}"]
+        raise "Missing definition for #{oid}" unless dep && !dep['deleted']
+        enqueue(dep.merge('force' => true))
+        defer_job(obj, 2)
+        return
+      end
+      with_root_coordinates do
+        flush_deltas(send: true)
+        ctx = ctx_for_object(obj)
+        untrack(ctx) if ctx && !obj['meta_only']
+        TeamHub.log_sync("APPLY #{oid} #{obj['kind']} r#{obj['rev']}#{obj['meta_only'] ? ' position' : ''}#{obj['deleted'] ? ' DELETE' : ''} from u#{obj['updated_by']}")
+        model_op('Team Hub: تحديث من الفريق', rollback: true) do
+          case obj['kind']
+          when 'definition' then apply_definition(obj, path)
+          when 'group' then obj['meta_only'] && live_entity(oid) ? apply_group_meta(obj) : apply_group(obj, path)
+          when 'loose' then apply_loose(obj, path)
+          else apply_component(obj)
+          end
+          raise "Apply left #{oid} missing" unless obj['deleted'] || local_exists?(obj)
+          verify_applied(obj)
         end
+        @content_dirty.delete(oid)
+        @touched.delete(oid)
+        @def_dirty.delete(did_of(oid)) if obj['kind'] == 'definition'
+        if obj['kind'] == 'loose'
+          baseline_loose
+        end
+        flush_deltas(send: false)
+        untrack(ctx) if ctx && !obj['meta_only']
+        ensure_tracking(LOOSE_OID) if ctx == LOOSE_OID
+        snapshot_fp(oid)
+        if obj['kind'] == 'definition' && (d = live_def(did_of(oid)))
+          d.instances.each { |i| entity_valid?(i) && (io = @eid_to_oid[i.entityID]) && snapshot_fp(io) }
+        end
+        refresh_overlay
       end
-      flush_deltas(send: false)
-      untrack(ctx) if ctx && !obj['meta_only']
-      ensure_tracking(LOOSE_OID) if ctx == LOOSE_OID
-      snapshot_fp(oid)
-      if obj['kind'] == 'definition' && (d = live_def(did_of(oid)))
-        d.instances.each { |i| (io = @eid_to_oid[i.entityID]) && snapshot_fp(io) }
-      end
-      verify_applied(obj)
-      refresh_overlay
     end
 
     def verify_applied(obj)
@@ -983,12 +1250,18 @@ module TeamHub
     def placement_unsafe?(obj)
       path = @model.active_path
       return false if path.nil? || path.empty?
-      open_defs = path.map(&:definition)
+      path = path.select { |e| trackable?(e) }
+      open_defs = path.map(&:definition).select { |d| entity_valid?(d) }
       ent = live_entity(obj['oid'])
-      return true if ent && (path.include?(ent) || (ent.respond_to?(:definition) && open_defs.include?(ent.definition)))
-      if obj['kind'] == 'component'
-        d = live_def((obj['meta'] || {})['def'])
-        return true if d && open_defs.include?(d)
+      return true if ent && path.any? { |e| same_entity?(e, ent) }
+      if ent && open_defs.any? { |d| same_entity?(d, ent.definition) }
+        return true
+      end
+      if obj['kind'] == 'definition'
+        return open_defs.any? { |d| d.get_attribute(DICT, 'did') == did_of(obj['oid']) }
+      elsif obj['kind'] == 'component'
+        defn = live_def((obj['meta'] || {})['def'])
+        return open_defs.any? { |d| same_entity?(d, defn) }
       end
       false
     end
@@ -996,7 +1269,7 @@ module TeamHub
     def editing_now?(oid)
       return editing_loose_now? if oid == LOOSE_OID
       root = (@model.active_path || []).first
-      root && @eid_to_oid[root.entityID] == oid
+      trackable?(root) && (@eid_to_oid[root.entityID] == oid || ctx_of_root(root) == oid)
     rescue StandardError
       false
     end
@@ -1004,26 +1277,44 @@ module TeamHub
     def apply_definition(obj, path)
       did = did_of(obj['oid'])
       old = live_def(did)
+      copies = @model.definitions.select { |d| entity_valid?(d) && !d.group? && !d.image? && d.get_attribute(DICT, 'did') == did }
       if obj['deleted']
-        if old && old.instances.empty?
-          @def_index.delete(did)
-          remove_definitions([old])
+        @def_index.delete(did)
+        copies.each do |d|
+          d.instances.to_a.each do |inst|
+            next unless entity_valid?(inst)
+            inst.locked = false if inst.locked?
+            top_level?(inst) ? erase_tracked(inst) : inst.erase!
+          end
+          @model.definitions.remove(d) if entity_valid?(d)
+          raise "Could not remove definition #{did}" if entity_valid?(d)
         end
         return
       end
-      newdef = load_definition(path, (obj['meta'] || {})['bb'])
+      meta = obj['meta'] || {}
+      placements = old ? old.instances.select { |i| entity_valid?(i) }.map { |i| i.transformation } : []
+      @objects.each_value do |o|
+        m = o['meta'] || {}
+        if o['kind'] == 'component' && !o['deleted'] && m['def'] == did && m['t'].is_a?(Array) && m['t'].size == 16
+          placements << Geom::Transformation.new(m['t'])
+        end
+      end
+      newdef = load_definition(path, meta, placements)
       @def_index[did] = newdef
-      if old && old != newdef
-        nested = nested_definitions(old)
-        old.instances.to_a.each do |inst|
+      # A group/blob can embed another copy of a shared definition. Replace all
+      # copies carrying this did, not just the one currently in @def_index.
+      copies.each do |d|
+        next unless entity_valid?(d) && !same_entity?(d, newdef)
+        nested = nested_definitions(d)
+        d.instances.to_a.each do |inst|
+          next unless entity_valid?(inst)
           was = inst.locked?
           inst.locked = false if was
           inst.definition = newdef
           inst.locked = true if was
         end
-        remove_definitions([old] + nested)
+        remove_definitions([d] + nested)
       end
-      meta = obj['meta'] || {}
       name = meta['name'].to_s
       begin
         newdef.name = name unless name.empty? || newdef.name == name
@@ -1033,6 +1324,32 @@ module TeamHub
       newdef.description = meta['description'].to_s
       newdef.set_attribute(DICT, 'did', did)
       newdef.set_attribute(DICT, 'rev', obj['rev'])
+      link_nested_definitions(newdef)
+    end
+
+    def link_nested_definitions(defn)
+      nested_definitions(defn).each do |d|
+        next unless entity_valid?(d) && !d.group? && !d.image?
+        did = d.get_attribute(DICT, 'did')
+        next unless did
+        canonical = live_def(did)
+        if canonical && !same_entity?(canonical, d)
+          d.instances.to_a.each do |inst|
+            next unless entity_valid?(inst)
+            was = inst.locked?
+            inst.locked = false if was
+            inst.definition = canonical
+            inst.locked = true if was
+          end
+          remove_definitions([d])
+        elsif canonical.nil?
+          @def_index[did] = d
+        end
+        server = @objects["d_#{did}"]
+        if server && !server['deleted'] && local_rev(server) < server['rev'].to_i
+          enqueue(server.merge('force' => true))
+        end
+      end
     end
 
     # A teammate only moved / renamed / repainted it: change it in place.
@@ -1053,9 +1370,12 @@ module TeamHub
         erase_tracked(old)
         return
       end
-      defn = load_definition(path, (obj['meta'] || {})['bb'])
+      meta = obj['meta'] || {}
+      placements = meta['t'].is_a?(Array) && meta['t'].size == 16 ? [Geom::Transformation.new(meta['t'])] : []
+      defn = load_definition(path, meta, placements)
+      link_nested_definitions(defn)
       grp = @model.entities.add_group
-      grp.entities.add_instance(defn, IDENTITY).explode
+      raise "Could not explode group #{oid}" unless grp.entities.add_instance(defn, IDENTITY).explode
       remove_definitions([defn])
       t = (obj['meta'] || {})['t']
       grp.transformation = Geom::Transformation.new(t) if t.is_a?(Array) && t.size == 16
@@ -1071,19 +1391,11 @@ module TeamHub
       end
       meta = obj['meta'] || {}
       defn = live_def(meta['def'])
-      unless defn
-        d = @objects["d_#{meta['def']}"]
-        if d && !d['deleted']
-          # Definition hasn't arrived yet: fetch it, then this instance again.
-          enqueue(d)
-          enqueue(obj)
-        end
-        return
-      end
+      raise "Missing definition for #{oid}" unless defn
       tr = meta['t'].is_a?(Array) && meta['t'].size == 16 ? Geom::Transformation.new(meta['t']) : IDENTITY
       if old.is_a?(Sketchup::ComponentInstance)
         old.locked = false
-        old.definition = defn unless old.definition == defn
+        old.definition = defn unless same_entity?(old.definition, defn)
         old.transformation = tr
         ent = old
       else
@@ -1103,15 +1415,15 @@ module TeamHub
       ent.hidden = meta['hidden'] ? true : false
       ent.set_attribute(DICT, 'oid', oid)
       ent.set_attribute(DICT, 'rev', obj['rev'])
-      erase_tracked(old) if old && old != ent
+      erase_tracked(old) if entity_valid?(old) && !same_entity?(old, ent)
       index_entity(ent)
       ent.locked = !mine?(oid)
     end
 
     def erase_tracked(ent)
-      return unless ent && ent.valid?
+      return unless entity_valid?(ent)
       oid = @eid_to_oid.delete(ent.entityID)
-      @index.delete(oid) if oid && @index[oid] == ent
+      @index.delete(oid) if oid && same_entity?(@index[oid], ent)
       defs = ent.is_a?(Sketchup::Group) ? [ent.definition] + nested_definitions(ent.definition) : []
       ent.locked = false if ent.locked?
       ent.erase!
@@ -1119,10 +1431,12 @@ module TeamHub
     end
 
     def nested_definitions(defn, acc = [])
+      return acc unless entity_valid?(defn)
       defn.entities.each do |e|
-        next unless e.is_a?(Sketchup::Group) || e.is_a?(Sketchup::ComponentInstance)
+        next unless trackable?(e)
         d = e.definition
-        next if acc.include?(d)
+        next unless entity_valid?(d)
+        next if acc.any? { |a| same_entity?(a, d) }
         acc << d
         nested_definitions(d, acc)
       end
@@ -1131,17 +1445,18 @@ module TeamHub
 
     # Removes definitions left unused by a replace, parents first.
     def remove_definitions(defs)
-      defs = defs.compact.uniq
-      synced = @def_index.values
+      defs = defs.select { |d| entity_valid?(d) }.uniq { |d| d.entityID }
+      @def_index.delete_if { |_, d| !entity_valid?(d) }
+      synced = @def_index.values.map { |d| d.entityID }
       loop do
         removed = false
         defs.each do |d|
-          next unless d.valid? && d.instances.empty? && !synced.include?(d)
+          next unless entity_valid?(d) && d.instances.empty? && !synced.include?(d.entityID)
           begin
             @model.definitions.remove(d)
-            removed = true
-          rescue StandardError
-            nil
+            removed = true unless entity_valid?(d)
+          rescue StandardError => e
+            TeamHub.log_sync("CLEANUP definition: #{e.message}")
           end
         end
         break unless removed
@@ -1152,12 +1467,12 @@ module TeamHub
       bb.empty? ? nil : [bb.min.to_a, bb.max.to_a].map { |p| p.map { |v| v.to_f.round(6) } }
     end
 
-    def load_definition(path, expect_bb = nil)
+    def load_definition(path, meta = {}, placements = [])
       tmp = File.join(@temp, "load_#{SecureRandom.hex(6)}.skp")
       FileUtils.cp(path, tmp)
       defn = @model.definitions.load(tmp)
       raise 'تعذر فتح ملف العنصر' unless defn
-      align_definition(defn, expect_bb)
+      align_definition(defn, meta, placements)
       defn
     ensure
       begin
@@ -1169,14 +1484,38 @@ module TeamHub
 
     # The sender told us where the contents sit (box min/max in x, y, z). If the
     # loaded copy sits anywhere else, move it back exactly; then double-check.
-    def align_definition(defn, expect_bb)
+    def fresh_bounds(defn)
+      defn.invalidate_bounds if defn.respond_to?(:invalidate_bounds)
+    rescue StandardError
+      nil
+    end
+
+    def align_definition(defn, meta, placements = [])
+      expect_bb = meta['bb']
+      unless meta['bb_space'] == 'local'
+        TeamHub.log_sync("ALIGN SKIP #{defn.name}: unmarked/legacy bounds") if expect_bb
+        return
+      end
       return unless expect_bb.is_a?(Array) && expect_bb.size == 2
+      return unless expect_bb.all? { |p| p.is_a?(Array) && p.size == 3 && p.all? { |v| v.is_a?(Numeric) && v.to_f.finite? } }
+      fresh_bounds(defn)
       have = defn.bounds
       return if have.empty?
       want_min = Geom::Point3d.new(*expect_bb[0])
       delta = want_min - have.min
       if delta.length > 0.0001
+        # The box is in the sender's local coordinates (local_bbox, 2.1+), so
+        # any offset is the export's fault (SketchUp writes an open
+        # definition in model space): move it back, as long as the size
+        # matches — a different size means different contents, not an offset.
+        want_size = Geom::Point3d.new(*expect_bb[1]) - want_min
+        have_size = have.max - have.min
+        if (want_size - have_size).length > 0.001
+          TeamHub.log_sync("ALIGN SKIP #{defn.name}: size differs have #{have_size.to_a.inspect} want #{want_size.to_a.inspect}")
+          return
+        end
         defn.entities.transform_entities(Geom::Transformation.translation(delta), defn.entities.to_a)
+        fresh_bounds(defn) # SketchUp keeps the old box until asked
         TeamHub.log_sync("ALIGN #{defn.name}: contents were off by #{delta.to_a.map { |v| v.to_f.round(3) }.inspect}, moved back")
       end
       got = bbox_a(defn.bounds)
@@ -1204,7 +1543,7 @@ module TeamHub
         @def_index.each do |did, d|
           d_oid = "d_#{did}"
           server = @objects[d_oid]
-          next unless d.valid? && server && !server['deleted'] && !mine?(d_oid) && server['updated_by'] == my_id
+          next unless entity_valid?(d) && server && !server['deleted'] && !mine?(d_oid) && server['updated_by'] == my_id
           next if d.get_attribute(DICT, 'rev') == server['rev'] || @pushing[d_oid] || @push_wanted.key?(d_oid)
           stamp << [d, server['rev']]
         end
@@ -1312,8 +1651,27 @@ module TeamHub
       when_idle do
         @sweep_pending = false
         @index.each_key { |o| @touched[o] = true }
+        @model.entities.each do |e|
+          next unless trackable?(e)
+          @added << e unless same_entity?(live_entity(e.get_attribute(DICT, 'oid')), e)
+        end
+        # Definitions have no observer with deltas disabled. Check them during
+        # sweeps too, including edits made through nested component instances.
+        with_root_coordinates do
+          @def_index.each do |did, d|
+            begin
+              next unless entity_valid?(d)
+              oid = "d_#{did}"
+              @def_dirty[did] = true if !@content_fp.key?(oid) || @content_fp[oid] != defn_fp(d)
+            rescue StandardError => error
+              @last_error = error.message
+              TeamHub.log_error(error)
+            end
+          end
+        end
         @loose_dirty = true
         scan
+        pump_pushes
         heal_step
       end
     end
@@ -1416,7 +1774,7 @@ module TeamHub
 
     def snapshot
       objs = @index.filter_map do |oid, e|
-        next unless e.valid?
+        next unless entity_valid?(e)
         {
           oid: oid,
           name: display_name(e),

@@ -63,7 +63,7 @@ module TeamHub
 
     # Which context does the user's open edit path belong to?
     def ctx_of_root(root)
-      return nil unless root
+      return nil unless trackable?(root)
       if root.is_a?(Sketchup::Group)
         @eid_to_oid[root.entityID]
       elsif root.is_a?(Sketchup::ComponentInstance)
@@ -166,7 +166,7 @@ module TeamHub
     end
 
     def tracking_valid?(t)
-      t && (t[:owner].nil? || (t[:owner].valid? && t[:owner] == ctx_owner(t[:ctx])))
+      t && (t[:owner].nil? || same_entity?(t[:owner], ctx_owner(t[:ctx])))
     end
 
     def ensure_tracking(ctx)

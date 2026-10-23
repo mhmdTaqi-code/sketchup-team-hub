@@ -227,10 +227,17 @@ module TeamHub
           post('A:left_g1')
           nxt('left G1')
         when 7
-          return unless seen('B:left_g2') && since > 12 # claims released + uploads done
-          model.active_path = [inst('C1')]
-          draw_in(inst('C1'), 70)
+          if @c_open.nil?
+            return unless seen('B:left_g2') && since > 12 # claims released + uploads done
+            model.active_path = [inst('C1')]
+            draw_in(inst('C1'), 70)
+            @c_open = Time.now
+            return
+          end
+          return if Time.now - @c_open < 5 # uploads happen while the component is still open
           model.active_path = nil
+          inst('C1').definition.invalidate_bounds
+          post("A:cbb=#{inst('C1').definition.bounds.min.to_a.map { |v| v.to_f.round(2) }.inspect}")
           model.selection.clear
           post('A:drew_c')
           nxt('drew inside the component (through C1)')
@@ -242,6 +249,10 @@ module TeamHub
           nxt('moved G1 +50 z while B moves G2')
         when 9
           return if since < 12
+          k1 = inst('K1')
+          check(k1 && origin(k1) == [18000.0, -16000.0, 0.0] && k1.definition.bounds.min.to_a.map(&:to_f) == [0.0, 0.0, 0.0] &&
+                k1.definition.entities.grep(Sketchup::Face).size == 6,
+                "B's new component K1 arrived on A in place (origin #{k1 && origin(k1).inspect}, contents min #{k1 && k1.definition.bounds.min.to_a.inspect})")
           copy = nil
           edit('copy G2') do
             copy = group('G2').copy
@@ -254,7 +265,8 @@ module TeamHub
         when 10
           return unless seen('B:deleted')
           gone = groups_named('G2 copy').empty? && groups_named('G2').size == 1
-          return unless gone || ms_since('B:deleted') > 8000
+          return unless (gone && inst('K1').nil?) || ms_since('B:deleted') > 8000
+          check(inst('K1').nil?, "B's delete of component K1 arrived on A")
           check(gone, "B's delete of the copy arrived on A #{ms_since('B:deleted')} ms later (copies #{groups_named('G2 copy').size}, G2 #{groups_named('G2').size})")
           post('A:loose_go')
           edit('A loose line') { model.entities.add_line([0, -700, 0], [300, -700, 0]) }
@@ -346,14 +358,27 @@ module TeamHub
           arrived = d.instances.size == 2 && d.entities.grep(Sketchup::Face).size >= 7
           return unless arrived || ms_since('A:drew_c') > 8000
           check(arrived, "A's drawing in the component reached B #{ms_since('A:drew_c')} ms after A drew it (faces #{d.entities.grep(Sketchup::Face).size}, copies #{d.instances.size})")
+          k = bus.keys.find { |x| x.start_with?('A:cbb=') }
+          return unless k || ms_since('A:drew_c') > 8000
+          inst('C1').definition.invalidate_bounds
+          mine_bb = inst('C1').definition.bounds.min.to_a.map { |v| v.to_f.round(2) }.inspect
+          check(k && k.sub('A:cbb=', '') == mine_bb, "component contents at the same x/y/z on B (A #{k && k.sub('A:cbb=', '')}, B #{mine_bb})")
           check(origin(inst('C1')) == [2000.0, 0.0, 0.0] && origin(inst('C2')) == [3000.0, 500.0, 0.0], "component copies stayed in place on B (C1 #{origin(inst('C1')).inspect}, C2 #{origin(inst('C2')).inspect})")
           post('B:comp_ok')
           nxt
         when 8
           return unless seen('A:move_go')
-          edit('B moves G2') { group('G2').transform!(Geom::Transformation.new([0, 70, 0])) }
+          edit('B moves G2 + adds component K1') do
+            group('G2').transform!(Geom::Transformation.new([0, 70, 0]))
+            d = model.definitions.add('Kbox')
+            f = d.entities.add_face([0, 0, 0], [100, 0, 0], [100, 100, 0], [0, 100, 0])
+            f.reverse! if f.normal.z < 0
+            f.pushpull(80)
+            model.entities.add_instance(d, Geom::Transformation.new([18000, -16000, 0])).name = 'K1'
+          end
           model.selection.clear
-          nxt('moved G2 +70 y while A moves G1')
+          post('B:added_k1')
+          nxt('moved G2 +70 y while A moves G1, and added a new component K1 at (18000, -16000)')
         when 9
           return unless seen('A:copied')
           if groups_named('G2 copy').size == 1 && groups_named('G2').size == 1
@@ -366,7 +391,11 @@ module TeamHub
         when 10
           return if since < 10 # the copy's claim on A's side expires first
           copy = groups_named('G2 copy').first
-          edit('B deletes the copy') { copy&.erase! }
+          edit('B deletes the copy and K1') do
+            copy&.erase!
+            inst('K1')&.erase!
+          end
+          model.definitions.purge_unused
           post('B:deleted')
           nxt('deleted the copy')
         when 11

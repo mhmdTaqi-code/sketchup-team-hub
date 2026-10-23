@@ -48,6 +48,9 @@ module TeamHub
         @polling = false
         next if @stopped
         if st == 200 && data
+          # Schedule before dispatch: a single observer/event exception must
+          # not strand the long-poll fallback with no next request.
+          UI.start_timer(0, false) { guard { poll } }
           was_offline = !connected?
           @status = :online
           @online = data['online'] if data['online']
@@ -59,7 +62,6 @@ module TeamHub
             run_jobs
           end
           notify
-          UI.start_timer(0, false) { guard { poll } } # straight back into the next long-poll
         elsif st == 401
           TeamHub.auth_expired
         else
@@ -75,7 +77,24 @@ module TeamHub
     def live_tick
       return if @stopped || !@loaded
       now = Time.now
+      if @suspended.positive?
+        @suspended_since ||= now
+        if now - @suspended_since > 10 && (@operation_depth || 0).zero? && !busy?
+          TeamHub.log_sync("WATCHDOG reset suspended #{@suspended} after #{(now - @suspended_since).round}s")
+          @suspended = 0
+          @suspended_since = nil
+          schedule_scan(0)
+        end
+      else
+        @suspended_since = nil
+      end
+      when_idle { pump_pushes } unless @push_wanted.empty? && @delete_wanted.empty?
+      run_jobs
       if ws_open?
+        if @last_claim_refresh.nil? || now - @last_claim_refresh >= 15
+          @last_claim_refresh = now
+          catch_up # claims may expire without an unclaim event
+        end
         if @last_ping_at.nil? || now - @last_ping_at >= PING_EVERY
           @last_ping_at = now
           ws_ping
@@ -171,6 +190,12 @@ module TeamHub
       return if keep.empty? && drop.empty?
       @client.request(:post, "/api/projects/#{pid}/claim", { 'oids' => keep, 'release' => drop }, timeout: 10) do |st, data|
         next unless st == 200 && data
+        data['granted'].each { |o| claims[o] = my_id }
+        data['denied'].each do |d|
+          my_claims.delete(d['oid'])
+          claims[d['oid']] = d['user']['id'] if d['user']
+          @users[d['user']['id']] = d['user'] if d['user']
+        end
         data['released'].each { |o| claims.delete(o) if claims[o] == my_id }
         refresh_overlay
       end
@@ -195,7 +220,7 @@ module TeamHub
         @last_t[oid] = ent.transformation.to_a
       else
         @last_t[oid] ||
-          (path.first == ent && path.size == 1 ? @model.edit_transform.to_a : ent.transformation.to_a)
+          (same_entity?(path.first, ent) && path.size == 1 ? @model.edit_transform.to_a : ent.transformation.to_a)
       end
     end
 

@@ -37,19 +37,46 @@ module TeamHub
 
     # Order-independent signature of an object's own geometry, in its local
     # coordinates. Only meaningful while no edit context is open.
-    def sighash_of_entities(ents)
+    def sighash_of_entities(ents, seen = {}, detailed = false)
       sigs = []
       ents.each do |e|
+        next unless entity_valid?(e)
+        unless detailed
+          # Keep the wire signature compatible with 2.0 peers and stored blobs.
+          case e
+          when Sketchup::Edge
+            sigs << "e#{[e.start.position, e.end.position].map { |p| pt_a(p).join(',') }.sort.join(';')}#{e.soft? ? 's' : ''}"
+          when Sketchup::Face
+            sigs << "f#{e.outer_loop.vertices.map { |v| pt_a(v.position).join(',') }.sort.join(';')}" \
+                    "|#{e.loops.size}|#{e.material&.name}|#{e.back_material&.name}"
+          when Sketchup::Group, Sketchup::ComponentInstance
+            b = e.definition.bounds
+            sigs << "i#{e.transformation.to_a.map { |v| r3(v) }.join(',')}|#{e.definition.entities.length}" \
+                    "|#{pt_a(b.min).join(',')}|#{pt_a(b.max).join(',')}"
+          end
+          next
+        end
+        appearance = "|#{e.layer.name}|#{e.hidden?}|#{e.material&.name}"
         case e
         when Sketchup::Edge
-          sigs << "e#{[e.start.position, e.end.position].map { |p| pt_a(p).join(',') }.sort.join(';')}#{e.soft? ? 's' : ''}"
+          sigs << "e#{[e.start.position, e.end.position].map { |p| pt_a(p).join(',') }.sort.join(';')}#{e.soft? ? 's' : ''}|#{e.smooth?}#{appearance}"
         when Sketchup::Face
-          sigs << "f#{e.outer_loop.vertices.map { |v| pt_a(v.position).join(',') }.sort.join(';')}" \
-                  "|#{e.loops.size}|#{e.material&.name}|#{e.back_material&.name}"
+          loops = e.loops.map { |lp| lp.vertices.map { |v| pt_a(v.position).join(',') }.sort.join(';') }.sort
+          sigs << "f#{loops.join('/')}|#{e.back_material&.name}#{appearance}"
         when Sketchup::Group, Sketchup::ComponentInstance
           b = e.definition.bounds
+          id = e.definition.entityID
+          nested = ''
+          unless seen[id]
+            seen[id] = true
+            nested = sighash_of_entities(e.definition.entities, seen, true)
+            seen.delete(id)
+          end
           sigs << "i#{e.transformation.to_a.map { |v| r3(v) }.join(',')}|#{e.definition.entities.length}" \
-                  "|#{pt_a(b.min).join(',')}|#{pt_a(b.max).join(',')}"
+                  "|#{pt_a(b.min).join(',')}|#{pt_a(b.max).join(',')}|#{nested}|#{e.name}#{appearance}"
+        else
+          b = e.bounds
+          sigs << "#{e.typename}|#{bbox_a(b).inspect}#{appearance}"
         end
       end
       Digest::SHA1.hexdigest(sigs.sort.join("\n"))
@@ -80,10 +107,36 @@ module TeamHub
       @heal_keys = @objects.keys if @heal_keys.nil? || @heal_keys.empty?
       @heal_keys.shift(HEAL_PER_SWEEP).each do |oid|
         o = @objects[oid]
-        next if o.nil? || o['deleted'] || o['updated_by'] == my_id && my_claims.key?(oid)
+        next if o.nil?
         next if @pushing[oid] || @push_wanted.key?(oid) || @touched[oid] || @content_dirty[oid]
-        next if claims[oid] == my_id || @jobs.any? { |j| j['oid'] == oid }
-        next if local_rev(o) != o['rev'].to_i # an update is on its way anyway
+        next if @delete_wanted[oid] || (@deleting || {})[oid]
+        next if @running_job && @running_job['oid'] == oid
+        next if @jobs.any? { |j| j['oid'] == oid }
+        if o['deleted']
+          if local_exists?(o) && (oid != LOOSE_OID || !loose_entities.empty? || loose_rev < o['rev'].to_i)
+            TeamHub.log_sync("HEAL deleted #{oid} r#{o['rev']}")
+            enqueue(o.merge('force' => true))
+          end
+          next
+        end
+        unless local_exists?(o)
+          # A definition nobody places any more (its last copy was deleted)
+          # is not missing; the components that use it bring it when needed.
+          if o['kind'] == 'definition'
+            did = did_of(oid)
+            used = @objects.each_value.any? { |c| c['kind'] == 'component' && !c['deleted'] && (c['meta'] || {})['def'] == did }
+            next unless used
+          end
+          TeamHub.log_sync("HEAL missing #{oid} r#{o['rev']}")
+          enqueue(o.merge('force' => true))
+          next
+        end
+        next if claims[oid] == my_id || (o['kind'] == 'definition' && @def_dirty[did_of(oid)])
+        if local_rev(o) != o['rev'].to_i
+          TeamHub.log_sync("HEAL revision #{oid} local r#{local_rev(o)} server r#{o['rev']}")
+          enqueue(o.merge('force' => true))
+          next
+        end
         meta = o['meta'] || {}
         if %w[group component].include?(o['kind']) && (ent = live_entity(oid)) && meta['t'].is_a?(Array)
           unless same_t?(ent.transformation.to_a, meta['t'])
@@ -96,8 +149,9 @@ module TeamHub
         next unless want
         have = object_sighash(oid)
         next if have.nil? || have == want
-        next if (@heal_failed ||= {})[oid] == o['rev']
-        @heal_failed[oid] = o['rev']
+        last = (@heal_failed ||= {})[oid]
+        next if last && last[0] == o['rev'] && Time.now - last[1] < 60
+        @heal_failed[oid] = [o['rev'], Time.now]
         TeamHub.log_sync("HEAL contents #{oid} (#{o['kind']} r#{o['rev']}) local #{have[0, 8]} != server #{want[0, 8]}")
         enqueue(o.merge('force' => true))
       end
@@ -150,14 +204,34 @@ module TeamHub
     def lost_race(oid, data)
       who = (data && data['user'] && data['user']['display_name']) || 'عضو ثاني'
       @new_local.delete(oid)
+      @push_wanted.delete(oid)
+      @touched.delete(oid)
+      @content_dirty.delete(oid)
+      @def_dirty.delete(did_of(oid)) if oid.start_with?('d_')
+      my_claims.delete(oid)
+      claims[oid] = data['user']['id'] if data && data['user']
       server = @objects[oid]
       TeamHub.log_sync("LOST #{oid} to #{who} (#{data && data['error']}) → taking theirs")
+      if server.nil? && data && data['error'] == 'being_edited'
+        # A claim can exist before the object's first upload. There is no team
+        # version to download yet, so retain this addition until the claim ends.
+        @new_local[oid] = true unless oid == LOOSE_OID || oid.start_with?('d_')
+        @push_wanted[oid] = true
+        (@push_retry_at ||= {})[oid] = Time.now + 10
+        return
+      end
       if oid == LOOSE_OID
         keep_my_loose(who) # my new lines become my own Group, nothing is erased
       else
         TeamHub.flash("#{who} جان يعدّل على «#{object_label(oid)}» قبلك، فخليت نسخته. انتظر يخلص وعدّل بعده.")
       end
-      enqueue(server.merge('force' => true)) if server && !server['deleted']
+      # The WS object event may still be behind the HTTP conflict response.
+      if server
+        enqueue(server.merge('force' => true, '_refresh' => true))
+      else
+        enqueue('oid' => oid, 'kind' => oid == LOOSE_OID ? 'loose' : (oid.start_with?('d_') ? 'definition' : 'component'),
+                'force' => true, '_refresh' => true)
+      end
     end
   end
 end
