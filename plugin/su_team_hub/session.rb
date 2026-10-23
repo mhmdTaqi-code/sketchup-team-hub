@@ -36,7 +36,8 @@ module TeamHub
   end
 
   class Session
-    POLL_INTERVAL = 1.5
+    POLL_INTERVAL = 1.0
+    SWEEP_INTERVAL = 3.0 # full check of every object for local changes
     SCAN_DELAY = 0.8
     MAX_PARALLEL_PUSHES = 4
     IDENTITY = Geom::Transformation.new
@@ -132,6 +133,7 @@ module TeamHub
     def stop
       @stopped = true
       UI.stop_timer(@poll_timer) if @poll_timer
+      UI.stop_timer(@sweep_timer) if @sweep_timer
       UI.stop_timer(@scan_timer) if @scan_timer
       UI.stop_timer(@idle_timer) if @idle_timer
       @poll_timer = @scan_timer = @idle_timer = nil
@@ -200,6 +202,8 @@ module TeamHub
     def start_polling
       UI.stop_timer(@poll_timer) if @poll_timer
       @poll_timer = UI.start_timer(POLL_INTERVAL, true) { guard { poll } }
+      UI.stop_timer(@sweep_timer) if @sweep_timer
+      @sweep_timer = UI.start_timer(SWEEP_INTERVAL, true) { guard { request_sweep } }
       poll
     end
 
@@ -441,7 +445,7 @@ module TeamHub
     # ------------------------------------------------------------ idle gate
 
     def busy?
-      @tool_busy && (Time.now - @busy_since) < 15
+      @tool_busy && (Time.now - @busy_since) < 3
     end
 
     # Runs the block when no tool is mid-operation, so sync edits never land
@@ -1164,6 +1168,27 @@ module TeamHub
         end
         notify
       end
+    end
+
+    # Every few seconds: compare every object with how it looked last time, so
+    # any change reaches the team even if SketchUp didn't report it.
+    def request_sweep
+      return if @sweep_pending || !@loaded || @stopped
+      @sweep_pending = true
+      when_idle do
+        @sweep_pending = false
+        @index.each_key { |o| @touched[o] = true }
+        @loose_dirty = true
+        scan
+      end
+    end
+
+    # "Sync now": push my changes and pull the team's right away.
+    def sync_now
+      request_sweep
+      poll
+      run_jobs
+      TeamHub.flash('دا يزامن هسه…')
     end
 
     def resync

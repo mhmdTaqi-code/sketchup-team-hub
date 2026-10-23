@@ -69,6 +69,12 @@
     border-radius: 7px; font-size: 12px; box-shadow: 0 4px 14px rgba(0,0,0,.2); }
   .foot { display: flex; gap: 10px; justify-content: center; flex-wrap: wrap; font-size: 12px; }
   .ltr { direction: ltr; text-align: left; }
+  .pagenav { display: flex; gap: 4px; background: var(--surface); border: 1px solid var(--border); border-radius: 9px; padding: 4px; }
+  .pagenav button { flex: 1; border: 0; background: none; border-radius: 6px; padding: 7px 6px; color: var(--muted); font-weight: 600; }
+  .pagenav button.active { background: var(--accent); color: #fff; }
+  .syncstate { font-size: 14px; font-weight: 700; padding: 8px 10px; border-radius: 8px; background: var(--ok-soft); color: var(--ok); }
+  .syncstate.busy { background: var(--warn-soft); color: var(--warn); }
+  .syncstate.off { background: var(--danger-soft); color: var(--danger); }
 </style>
 </head>
 <body>
@@ -96,35 +102,53 @@
     <p class="muted" style="margin:8px 0 0;font-size:12px">العنوان تاخذه من صاحب السيرفر. إذا تشتغل من البيت، لازم Radmin VPN يكون شغال.</p>
   </form>
 
-  <!-- Choose project -->
+  <nav id="pagenav" class="pagenav hidden">
+    <button data-page="live">المشروع الحالي</button>
+    <button data-page="files">📁 الملفات المشتركة</button>
+  </nav>
+
+  <!-- Shared files page -->
   <div id="choose" class="hidden">
     <div class="card">
-      <h3>هذا الملف</h3>
-      <div id="file-info"></div>
-    </div>
-    <div class="card">
-      <div class="row" style="margin-bottom:6px"><h3 class="grow" style="margin:0">الملفات المشتركة</h3><button class="small" data-act="projects">تحديث</button></div>
+      <div class="row" style="margin-bottom:6px"><h3 class="grow" style="margin:0">📁 الملفات المشتركة</h3><button class="small" data-act="projects">تحديث</button></div>
+      <div class="sub" style="margin-bottom:6px">أي ملف يشاركه واحد من الفريق يطلع هنا. نزّله وينفتح ويتصل وحده.</div>
       <ul id="projects"></ul>
       <form id="new-project" class="row hidden" style="margin-top:8px">
         <input name="name" class="grow" placeholder="اسم مشروع جديد" required>
         <button class="small">إنشاء</button>
       </form>
     </div>
+    <div class="card">
+      <h3>الملف المفتوح هسه</h3>
+      <div id="file-info"></div>
+    </div>
   </div>
 
   <!-- Connected -->
   <div id="live" class="hidden">
+    <!-- Sync first: state + the buttons you actually use -->
     <div class="card">
-      <div class="row" style="margin-bottom:8px">
+      <div class="row" style="margin-bottom:6px">
         <h2 class="grow" id="project-name" style="margin:0"></h2>
       </div>
-      <div class="stats" id="stats"></div>
-      <div class="grid3" style="margin-top:10px">
-        <button class="primary" data-act="reserve" title="اختياري: محد غيرك يكدر يعدل على المحدد لحد ما تفكه">حجز المحدد</button>
-        <button data-act="release" title="يرفع آخر تعديلاتك ويفك الحجز">إلغاء حجز المحدد</button>
-        <button data-act="release_all">إلغاء كل حجوزاتي</button>
-      </div>
+      <div id="sync-state" class="syncstate"></div>
+      <div class="stats" id="stats" style="margin-top:6px"></div>
       <div id="warnings" style="display:flex;flex-direction:column;gap:6px;margin-top:8px"></div>
+      <div class="grid3" style="margin-top:10px">
+        <button class="primary" data-act="sync_now" title="يرفع تعديلاتك ويسحب تعديلات الفريق هسه">⟳ مزامنة هسه</button>
+        <button data-act="share" title="يرفع الملف كامل من جديد، للي ينضم جديد">⇪ رفع الملف من جديد</button>
+        <button data-act="resync" title="يعيد مطابقة كل الملف ويا السيرفر">مزامنة كاملة</button>
+      </div>
+      <div class="sub" style="margin:10px 0 4px">الحجز (اختياري): محد غيرك يعدّل على اللي تحجزه</div>
+      <div class="grid3">
+        <button data-act="reserve">🔒 حجز المحدد</button>
+        <button data-act="release">فك المحدد</button>
+        <button data-act="release_all">فك كل حجوزاتي</button>
+      </div>
+      <div class="foot" style="margin-top:8px">
+        <button class="link" data-act="dashboard">لوحة التحكم</button>
+        <button class="link" data-act="disconnect">قطع الاتصال</button>
+      </div>
     </div>
 
     <div class="card">
@@ -160,12 +184,6 @@
       </div>
     </div>
 
-    <div class="foot">
-      <button class="link" data-act="share">رفع الملف المشترك من جديد</button>
-      <button class="link" data-act="resync">مزامنة كاملة</button>
-      <button class="link" data-act="dashboard">لوحة التحكم</button>
-      <button class="link" data-act="disconnect">قطع الاتصال</button>
-    </div>
   </div>
 
   <div class="foot" id="account-foot">
@@ -194,8 +212,15 @@ const TH = {
     if (up) $('#update-text').textContent = `نسخة جديدة من البلكن (${up.version}) موجودة على السيرفر. عندك ${s.version}.`;
     $('#version').textContent = `${s.su_version || ''} · Team Hub ${s.version}`;
     $('#login').classList.toggle('hidden', loggedIn);
-    $('#choose').classList.toggle('hidden', !loggedIn || s.connected);
-    $('#live').classList.toggle('hidden', !s.connected);
+    // Two pages: the current project (when connected) and the shared files.
+    const page = s.connected ? (this.page || 'live') : 'files';
+    $('#pagenav').classList.toggle('hidden', !loggedIn);
+    document.querySelectorAll('#pagenav button').forEach((b) => {
+      b.classList.toggle('active', b.dataset.page === page);
+      if (b.dataset.page === 'live') b.classList.toggle('hidden', !s.connected);
+    });
+    $('#choose').classList.toggle('hidden', !loggedIn || page !== 'files');
+    $('#live').classList.toggle('hidden', !s.connected || page !== 'live');
     $('#logout').classList.toggle('hidden', !loggedIn);
     $('#who').textContent = s.me ? s.me.display_name : '';
     const bz = $('#busy');
@@ -214,8 +239,8 @@ const TH = {
       }
       return;
     }
-    if (!s.connected) return this.renderChoose(s);
-    this.renderLive(s);
+    this.renderChoose(s);
+    if (s.connected) this.renderLive(s);
   },
 
   appLabel(u) {
@@ -237,7 +262,9 @@ const TH = {
     const projects = s.projects || [];
     $('#projects').innerHTML = projects.length ? projects.map((p) => {
       let actions = '';
-      if (b && b.project_id === p.id) actions = `<button class="primary small" data-connect="${p.id}" data-mode="resume">اتصال</button>`;
+      if (b && b.project_id === p.id) actions = s.connected
+        ? '<span class="tag" style="color:var(--ok)">● مفتوح هسه</span>'
+        : `<button class="primary small" data-connect="${p.id}" data-mode="resume">اتصال</button>`;
       else if (p.file) actions = `<button class="primary small" data-download="${p.id}">⇩ تحميل الملف المشترك</button>`;
       const when = p.file && p.file.uploaded_at ? new Date(p.file.uploaded_at).toLocaleDateString('ar-IQ') : '';
       const fileInfo = p.file ? `${(p.file.size / 1048576).toFixed(1)} MB${when ? ' · ' + when : ''}` : 'بعده ما انرفع';
@@ -248,14 +275,19 @@ const TH = {
 
   renderLive(s) {
     $('#project-name').textContent = s.project ? s.project.name : '';
-    const parts = [`<span><b>${s.total}</b> عنصر</span>`, `<span>حجوزاتي <b>${s.my_count}</b></span>`];
-    if (s.uploads) parts.push(`<span>يرفع <b>${s.uploads}</b></span>`);
-    if (s.downloads) parts.push(`<span>ينزّل <b>${s.downloads}</b></span>`);
-    if (!s.uploads && !s.downloads && s.status === 'online' && s.loaded) parts.push('<span style="color:var(--ok)">✓ متزامن</span>');
+    const parts = [`<span><b>${s.total}</b> عنصر</span>`];
+    if (s.my_count) parts.push(`<span>حاجز <b>${s.my_count}</b></span>`);
     $('#stats').innerHTML = parts.join('');
+    const st = $('#sync-state');
+    if (s.status === 'offline') { st.className = 'syncstate off'; st.textContent = '⚠ مقطوع عن السيرفر، تعديلاتك محفوظة وترتفع من يرجع'; }
+    else if (s.uploads || s.downloads) {
+      st.className = 'syncstate busy';
+      st.textContent = [s.uploads ? `⇪ يرفع ${s.uploads}` : '', s.downloads ? `⇩ ينزّل ${s.downloads}` : ''].filter(Boolean).join(' · ') + '…';
+    } else if (!s.loaded) { st.className = 'syncstate busy'; st.textContent = 'يتصل…'; }
+    else { st.className = 'syncstate'; st.textContent = '✓ متزامن · يفحص كل 3 ثواني'; }
 
     const warns = [];
-    if (s.status === 'offline') warns.push('الاتصال بالسيرفر مقطوع. تعديلاتك محفوظة وراح ترتفع من يرجع الاتصال. تأكد من Radmin VPN.');
+    if (s.status === 'offline') warns.push('تأكد إن Radmin VPN شغال عند الاثنين.');
     if (s.raw_geometry > 2000) warns.push(`أكو ${s.raw_geometry} خط/سطح سايب. يتزامنون، بس ككتلة وحدة، فإذا اثنين رسموا خطوط سايبة بنفس اللحظة يمشي تعديل آخر واحد. للشغل المتوازي سووها Group.`);
     if (s.me && s.me.role === 'viewer') warns.push('حسابك مشاهدة فقط.');
     $('#warnings').innerHTML = warns.map((w) => `<div class="warn">${esc(w)}</div>`).join('');
@@ -368,9 +400,10 @@ $('#chat-form').addEventListener('submit', (ev) => {
 });
 
 document.addEventListener('click', (ev) => {
-  const el = ev.target.closest('[data-act],[data-connect],[data-download],[data-focus],[data-reserve],[data-release],[data-tab],[data-f]');
+  const el = ev.target.closest('[data-page],[data-act],[data-connect],[data-download],[data-focus],[data-reserve],[data-release],[data-tab],[data-f]');
   if (!el) return;
   const d = el.dataset;
+  if (d.page) { TH.page = d.page; TH.render(TH.s); return; }
   if (d.act) act(d.act);
   else if (d.connect) act('connect', { project_id: Number(d.connect), mode: d.mode });
   else if (d.download) act('download_file', { project_id: Number(d.download) });

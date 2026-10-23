@@ -253,12 +253,25 @@ function renderOverview() {
   if (atBottom) box.scrollTop = box.scrollHeight;
 }
 
+// Re-read the project list (new files may have been shared meanwhile).
+async function refreshFiles() {
+  try {
+    S.projects = (await api('GET', `/api/projects${S.user.role === 'admin' ? '?all=1' : ''}`)).projects;
+    renderSharedFiles();
+  } catch (e) { toast(e.message); }
+}
+
 function renderSharedFiles() {
-  const list = (S.projects || []).filter((p) => p.file && !p.archived);
-  $('#shared-files').innerHTML = list.length ? list.map((p) => `<li>
-    <div class="grow"><b>${esc(p.name)}</b> <span class="muted">${fmtSize(p.file.size)} · ${fmtTime(p.file.uploaded_at)} · ${p.online} متصل</span></div>
-    <a class="btn small primary" href="/download/project/${p.id}.skp?token=${S.token}">تحميل .skp</a>
-  </li>`).join('') : '<li class="empty">ماكو ملفات مشتركة بعد</li>';
+  const list = (S.projects || []).filter((p) => p.file && !p.archived)
+    .sort((a, b) => (b.file.uploaded_at || 0) - (a.file.uploaded_at || 0));
+  $('#shared-files').innerHTML = list.length ? list.map((p) => `<tr>
+    <td><b>${esc(p.name)}</b>${p.id === S.pid ? ' <span class="tag">المفتوح هنا</span>' : ''}</td>
+    <td class="num">${fmtSize(p.file.size)}</td>
+    <td>${fmtTime(p.file.uploaded_at)}</td>
+    <td>${esc(userName(p.file.uploaded_by))}</td>
+    <td class="num">${p.online}</td>
+    <td><a class="btn small primary" href="/download/project/${p.id}.skp?token=${S.token}">⇩ تحميل .skp</a></td>
+  </tr>`).join('') : '<tr><td colspan="6" class="empty">ماكو ملفات مشتركة بعد. افتح ملف بـ SketchUp ودوس «مشاركة هذا الملف».</td></tr>';
 }
 
 function renderObjects() {
@@ -475,6 +488,7 @@ $('#tabs').addEventListener('click', (ev) => {
   $$('#tabs button').forEach((x) => x.classList.toggle('active', x === b));
   $$('main > section').forEach((s) => s.classList.toggle('hidden', s.dataset.view !== b.dataset.tab));
   if (b.dataset.tab === 'connect') renderConnect();
+  if (b.dataset.tab === 'files') refreshFiles();
 });
 
 boot().catch((e) => { document.body.textContent = `تعذر الاتصال بالسيرفر: ${e.message}`; });

@@ -325,6 +325,7 @@ module TeamHub
       when 'focus' then s&.focus(payload['oid'])
       when 'chat' then s&.chat(payload['text'].to_s)
       when 'resync' then s&.resync
+      when 'sync_now' then s&.sync_now
       when 'dashboard' then UI.openURL(pref('server', ''))
       when 'update_plugin' then install_update
       end

@@ -44,6 +44,7 @@
     </header>
     <nav class="tabs" id="tabs">
       <button data-tab="overview" class="active">نظرة عامة</button>
+      <button data-tab="files">📁 الملفات المشتركة</button>
       <button data-tab="objects">العناصر</button>
       <button data-tab="activity">النشاط</button>
       <button data-tab="team" data-admin>الفريق</button>
@@ -65,17 +66,25 @@
           </div>
         </div>
         <div class="card">
-          <h3>الملفات المشتركة</h3>
-          <p class="muted">أي واحد يفتح ملف بـ SketchUp ويدوس «مشاركة هذا الملف» يطلع هنا. نزّله، وافتحه بـ SketchUp، ويتصل وحده.</p>
-          <ul id="shared-files" class="list"></ul>
-        </div>
-        <div class="card">
           <h3>دردشة الفريق</h3>
           <div id="chat" class="chat"></div>
           <form id="chat-form" class="row">
             <input name="text" placeholder="اكتب رسالة للفريق…" autocomplete="off">
             <button class="btn primary">إرسال</button>
           </form>
+        </div>
+      </section>
+
+      <section data-view="files" class="hidden">
+        <div class="card">
+          <h3>📁 الملفات المشتركة</h3>
+          <p class="muted">كل ملف يشاركه واحد من الفريق من SketchUp («مشاركة هذا الملف») يطلع هنا. نزّله وافتحه بـ SketchUp، ويتصل بالفريق وحده.</p>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>الملف</th><th>الحجم</th><th>انرفع</th><th>بواسطة</th><th>متصلين</th><th></th></tr></thead>
+              <tbody id="shared-files"></tbody>
+            </table>
+          </div>
         </div>
       </section>
 
