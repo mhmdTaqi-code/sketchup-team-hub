@@ -91,7 +91,11 @@ module TeamHub
           @stage = -1
           return
         end
-        @role == 'A' ? step_a : step_b
+        case @role
+        when 'A' then step_a
+        when 'P' then step_p
+        else step_b
+        end
       rescue StandardError => e
         log("ERROR stage #{@stage}: #{e.class}: #{e.message} #{e.backtrace.first}")
         @stage = -1
@@ -285,6 +289,49 @@ module TeamHub
           log("A model: #{mine}")
           log("B model: #{theirs}") if theirs != mine
           log("transport=#{transport} ping=#{TeamHub.session.ping_ms.inspect} ms")
+          log('DONE')
+          @stage = -1
+        end
+      end
+
+      # ------------------------------------------------------------ bot P (big model: the plugin must stay fast)
+      def step_p
+        case @stage
+        when 0
+          TeamHub.login(@cfg['server'], @cfg['user'], @cfg['pass'])
+          nxt('login sent')
+        when 1
+          return unless TeamHub.logged_in? && TeamHub.me
+          t = Time.now
+          edit('big model') do
+            model.entities.clear!
+            400.times do |i|
+              g = model.entities.add_group
+              g.name = "M#{i}"
+              x = (i % 20) * 1500
+              y = (i / 20) * 1500
+              10.times do |k|
+                f = g.entities.add_face([x, y + k * 100, 0], [x + 900, y + k * 100, 0], [x + 900, y + k * 100 + 80, 0], [x, y + k * 100 + 80, 0])
+                f.pushpull(-300 - k * 10)
+              end
+            end
+            30_000.times { |i| model.entities.add_line([i * 3, -5000, 0], [i * 3, -4000, 0]) }
+          end
+          model.save(@cfg['file'])
+          nxt("built 400 groups (#{model.entities.grep(Sketchup::Group).sum { |g| g.entities.size }} entities) + 30000 loose lines in #{(Time.now - t).round(1)} s")
+          TeamHub.load_projects { TeamHub.share_file }
+        when 2
+          return unless connected? && since > 5
+          s = TeamHub.session
+          times = 3.times.map do
+            t = Time.now
+            s.instance_variable_get(:@index).each_key { |o| s.instance_variable_get(:@touched)[o] = true }
+            s.instance_variable_set(:@loose_dirty, true)
+            s.scan
+            s.heal_step
+            ((Time.now - t) * 1000).round
+          end
+          check(times.max < 1500, "a full sweep of the big model stays short: #{times.inspect} ms")
           log('DONE')
           @stage = -1
         end

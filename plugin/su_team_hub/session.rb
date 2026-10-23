@@ -815,10 +815,13 @@ module TeamHub
       defn_fp(ent.definition)
     end
 
+    # Cheap on purpose: it runs for every object on every sweep. A full
+    # geometry hash of a big model every 3 s froze SketchUp ("Not Responding").
+    # Real edits are reported by the observers; this only catches the rest.
     def defn_fp(d)
+      fresh_bounds(d)
       b = d.bounds
-      [d.entities.length, b.min.to_a.map { |v| v.round(5) }, b.max.to_a.map { |v| v.round(5) },
-       sighash_of_entities(d.entities, {}, true)]
+      [d.entities.length, b.min.to_a.map { |v| v.round(5) }, b.max.to_a.map { |v| v.round(5) }]
     end
 
     def snapshot_fp(oid)
@@ -1647,9 +1650,13 @@ module TeamHub
     # any change reaches the team even if SketchUp didn't report it.
     def request_sweep
       return if @sweep_pending || !@loaded || @stopped
+      # A slow sweep (very big model) waits longer before the next one, so
+      # SketchUp always has time for the user.
+      return if @next_sweep_at && Time.now < @next_sweep_at
       @sweep_pending = true
       when_idle do
         @sweep_pending = false
+        sweep_started = Time.now
         @index.each_key { |o| @touched[o] = true }
         @model.entities.each do |e|
           next unless trackable?(e)
@@ -1673,6 +1680,9 @@ module TeamHub
         scan
         pump_pushes
         heal_step
+        cost = Time.now - sweep_started
+        @next_sweep_at = Time.now + [cost * 10, 60].min
+        TeamHub.log_sync("SLOW sweep #{(cost * 1000).round} ms, next in #{(cost * 10).round(1)} s") if cost > 0.3
       end
     end
 

@@ -52,7 +52,7 @@ module TeamHub
     end
 
     def loose_content_fp
-      [loose_fp, sighash_of_entities(loose_entities, {}, true)]
+      loose_fp # counts + total area/length: cheap enough for every sweep
     end
 
     # Loose geometry travels live as deltas; this full copy is only for people

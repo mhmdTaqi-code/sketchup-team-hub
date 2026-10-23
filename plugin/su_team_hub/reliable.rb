@@ -105,7 +105,14 @@ module TeamHub
     def heal_step
       return if @stopped || !@loaded || !(@model.active_path || []).empty? || busy?
       @heal_keys = @objects.keys if @heal_keys.nil? || @heal_keys.empty?
-      @heal_keys.shift(HEAL_PER_SWEEP).each do |oid|
+      heal_started = Time.now
+      checked = 0
+      while (oid = @heal_keys.shift)
+        # small time budget per sweep, so a big model never freezes SketchUp
+        if (checked += 1) > HEAL_PER_SWEEP || Time.now - heal_started > 0.08
+          @heal_keys.unshift(oid)
+          break
+        end
         o = @objects[oid]
         next if o.nil?
         next if @pushing[oid] || @push_wanted.key?(oid) || @touched[oid] || @content_dirty[oid]
@@ -147,7 +154,13 @@ module TeamHub
         end
         want = meta['sighash']
         next unless want
+        # Re-hashing a huge object is expensive: only when its cheap
+        # fingerprint changed since the last time it matched the server.
+        cheap = oid == LOOSE_OID ? loose_fp : (oid.start_with?('d_') ? (d = live_def(did_of(oid))) && defn_fp(d) : (e = live_entity(oid)) && content_fp(e))
+        (@heal_ok ||= {})
+        next if @heal_ok[oid] == [o['rev'], cheap]
         have = object_sighash(oid)
+        @heal_ok[oid] = [o['rev'], cheap] if have == want
         next if have.nil? || have == want
         last = (@heal_failed ||= {})[oid]
         next if last && last[0] == o['rev'] && Time.now - last[1] < 60
