@@ -50,13 +50,18 @@ module TeamHub
       remember_loose_ids
     end
 
+    # Loose geometry travels live as deltas; this full copy is only for people
+    # joining later. It is made in the model root context only (inside a Group
+    # SketchUp would move it to edit-space coordinates).
     def scan_loose
       return unless @loose_dirty
-      @loose_dirty = false
       return if viewer? || reserved_by_other?(LOOSE_OID)
+      return unless (@model.active_path || []).empty?
+      return if delta_live?(LOOSE_OID) && Time.now - (@loose_cp_at || Time.at(0)) < CHECKPOINT_EVERY
+      @loose_dirty = false
       fp = loose_fp
       return if fp == @loose_base
-      note_activity(LOOSE_OID)
+      @loose_cp_at = Time.now
       request_push(LOOSE_OID, true)
     end
 
@@ -80,8 +85,6 @@ module TeamHub
         elsif st.zero?
           @status = :offline
           @push_wanted[LOOSE_OID] = true
-        elsif st == 409 || (st == 423 && data && data['error'] == 'being_edited')
-          when_idle { keep_both(LOOSE_OID, data && data['user']) } # my new lines become my own Group
         elsif st == 423
           TeamHub.flash('الخطوط السائبة محجوزة من عضو ثاني')
         end
@@ -92,7 +95,9 @@ module TeamHub
 
     # Group a copy of the loose geometry just long enough to save it, then undo.
     def export_loose
+      raise 'inside a Group: loose export waits for the model root' unless (@model.active_path || []).empty?
       out = File.join(@temp, "loose_#{SecureRandom.hex(6)}.skp")
+      untrack(LOOSE_OID) # the temporary group must not become deltas
       @suspended += 1
       @model.start_operation('Team Hub export', true)
       begin
@@ -101,6 +106,7 @@ module TeamHub
       ensure
         @model.abort_operation
         @suspended -= 1
+        ensure_tracking(LOOSE_OID)
       end
       raise 'تعذر حفظ الخطوط السائبة' unless ok && File.exist?(out)
       [File.binread(out)].pack('m0')

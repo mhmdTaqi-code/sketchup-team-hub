@@ -567,16 +567,6 @@ function writeObject(pid, user, oid, body) {
     if (lock && lock.user_id !== user.id) {
       throw httpError(423, 'locked_by_other', { user: userBrief(lock.user_id) });
     }
-    const claim = claimOf(pid, oid);
-    if (claim && claim.user_id !== user.id) {
-      throw httpError(423, 'being_edited', { user: userBrief(claim.user_id) });
-    }
-    // Conflict guard: my copy was based on an older revision that someone
-    // else has changed since. Refuse, so the client keeps both versions
-    // instead of silently erasing theirs.
-    if (live && body.base_rev != null && Number(body.base_rev) < obj.rev && obj.updated_by !== user.id) {
-      throw httpError(409, 'conflict', { rev: obj.rev, user: userBrief(obj.updated_by) });
-    }
     let blob = obj ? obj.blob : null;
     let size = obj ? obj.size : null;
     if (typeof body.data === 'string' && body.data.length) {
@@ -612,10 +602,6 @@ function deleteObject(pid, user, oid, baseRev) {
     const lock = q.lock.get(pid, oid);
     if (lock && lock.user_id !== user.id) {
       throw httpError(423, 'locked_by_other', { user: userBrief(lock.user_id) });
-    }
-    const claim = claimOf(pid, oid);
-    if (claim && claim.user_id !== user.id) {
-      throw httpError(423, 'being_edited', { user: userBrief(claim.user_id) });
     }
     if (!obj) {
       // Never changed since the shared file was handed out: record the deletion
@@ -841,6 +827,21 @@ route('PATCH', '/api/projects/:pid', async (ctx) => {
 
 route('GET', '/api/ping', () => ({ t: now() }));
 
+route('POST', '/api/projects/:pid/delta', async (ctx) => {
+  requireRole(ctx.user, 'admin', 'editor');
+  const p = getProject(ctx.params.pid);
+  const b = await readJson(ctx.req);
+  const target = String(b.ctx || '');
+  if (!/^[A-Za-z0-9_-]{4,64}$/.test(target)) throw httpError(400, 'invalid_ctx');
+  const lock = q.lock.get(p.id, target);
+  if (lock && lock.user_id !== ctx.user.id) throw httpError(423, 'locked_by_other', { user: userBrief(lock.user_id) });
+  const rm = Array.isArray(b.rm) ? b.rm.slice(0, 20000).map(String) : [];
+  const add = Array.isArray(b.add) ? b.add.slice(0, 20000) : [];
+  if (!rm.length && !add.length) return { ok: true, empty: true };
+  const seq = tx(() => emit(p.id, 'delta', { ctx: target, rm, add, by: ctx.user.id, n: Number(b.n) || 0 }, ctx.user.id));
+  return { ok: true, seq };
+});
+
 // Claim objects I'm working on (and release the ones I'm done with).
 route('POST', '/api/projects/:pid/claim', async (ctx) => {
   requireRole(ctx.user, 'admin', 'editor');
@@ -855,9 +856,10 @@ route('POST', '/api/projects/:pid/claim', async (ctx) => {
   for (const oid of oids) {
     const lock = q.lock.get(p.id, oid);
     const c = claimOf(p.id, oid);
-    const blocker = (lock && lock.user_id !== ctx.user.id) ? lock.user_id : (c && c.user_id !== ctx.user.id) ? c.user_id : null;
+    // Only a reservation blocks; several people can be "editing" the same thing.
+    const blocker = (lock && lock.user_id !== ctx.user.id) ? lock.user_id : null;
     if (blocker) { denied.push({ oid, user: userBrief(blocker) }); continue; }
-    if (!c) fresh.push(oid);
+    if (!c || c.user_id !== ctx.user.id) fresh.push(oid);
     claims.set(`${p.id}:${oid}`, { user_id: ctx.user.id, until: t + CLAIM_MS });
     granted.push(oid);
   }

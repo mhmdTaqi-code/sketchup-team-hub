@@ -98,7 +98,7 @@ module TeamHub
     end
     # Everyone edits everything; a reservation is optional and only blocks others.
     def mine?(oid)
-      !viewer? && (@locks[oid].nil? || @locks[oid] == my_id) && !claimed_by_other?(oid)
+      !viewer? && (@locks[oid].nil? || @locks[oid] == my_id)
     end
     def reserved_by_me?(oid)
       @locks[oid] == my_id
@@ -144,6 +144,7 @@ module TeamHub
       rescue StandardError
         nil
       end
+      untrack_all
       TeamHub.detach_overlay(@model, @overlay)
       @model.active_view.invalidate rescue nil
     end
@@ -193,6 +194,7 @@ module TeamHub
       end
       rebuild_index
       baseline_all
+      ensure_tracking(LOOSE_OID)
       reconcile_with_server
       @raw_count = count_raw_geometry
       apply_local_locks
@@ -233,7 +235,14 @@ module TeamHub
             # just update it in place, nothing to download.
             same = prev && p['kind'] == 'group' && p['blob'] && prev['blob'] == p['blob'] &&
                    local_rev(p) == prev['rev'].to_i
-            enqueue(same ? p.merge('meta_only' => true) : p)
+            ctx = ctx_for_object(p)
+            if ctx && delta_live?(ctx)
+              # Live deltas already brought these contents: never replace
+              # (that would drop what someone is drawing right now).
+              p['kind'] == 'group' ? enqueue(p.merge('meta_only' => true)) : stamp_rev_later(p)
+            else
+              enqueue(same ? p.merge('meta_only' => true) : p)
+            end
           end
         end
       when 'lock'
@@ -248,6 +257,8 @@ module TeamHub
           TeamHub.flash("انفك حجزك على: #{names}")
         end
         when_idle { apply_local_locks(p['oids']) }
+      when 'delta'
+        enqueue_delta(p, u) unless p['by'] == my_id
       when 'claim'
         p['oids'].each { |o| claims[o] = p['user_id'] }
         when_idle { apply_local_locks(p['oids']) } unless p['user_id'] == my_id
@@ -350,6 +361,7 @@ module TeamHub
 
     def on_commit
       return if @suspended.positive? || !@loaded
+      flush_deltas(send: true)
       root = (@model.active_path || []).first
       if root && (oid = @eid_to_oid[root.entityID])
         if root.is_a?(Sketchup::Group)
@@ -382,6 +394,7 @@ module TeamHub
 
     def on_undo
       return if @suspended.positive? || !@loaded
+      flush_deltas(send: true)
       @after_undo = true
       schedule_scan
     end
@@ -412,7 +425,8 @@ module TeamHub
       oid = @eid_to_oid[root.entityID]
       return unless oid
       @touched[oid] = true
-      blocked = (reserved_by_other?(oid) || claimed_by_other?(oid)) ? oid : nil
+      (ctx = ctx_of_root(root)) && ensure_tracking(ctx)
+      blocked = reserved_by_other?(oid) ? oid : nil
       unless blocked
         note_activity(oid) do |holder|
           UI.start_timer(0, false) { @model.close_active rescue nil }
@@ -514,8 +528,10 @@ module TeamHub
           changed = (@meta_fp.key?(oid) && @meta_fp[oid] != meta_fp(ent)) ||
                     (@content_fp.key?(oid) && @content_fp[oid] != content_fp(ent))
           if changed
-            holder = @users[claims[oid] || @locks[oid]]
-            keep_both(oid, holder)
+            holder = @users[@locks[oid]] || {}
+            TeamHub.flash("«#{display_name(ent)}» محجوز من #{holder['display_name'] || 'عضو ثاني'}، رجّعته مثل ما جان.")
+            server = @objects[oid]
+            enqueue(server.merge('force' => true)) if server && !server['deleted']
             snapshot_fp(oid)
           end
           next
@@ -530,7 +546,13 @@ module TeamHub
         cfp = content_fp(ent)
         content = @content_dirty.delete(oid) || @new_local[oid] ||
                   (@content_fp.key?(oid) && @content_fp[oid] != cfp)
+        if content && delta_live?(oid) && editing_now?(oid) &&
+           Time.now - ((@last_cp ||= {})[oid] || Time.at(0)) < CHECKPOINT_EVERY
+          @content_dirty[oid] = true # deltas carry it live; full copy later
+          content = false
+        end
         next unless content || !@meta_fp.key?(oid) || @meta_fp[oid] != mfp
+        (@last_cp ||= {})[oid] = Time.now if content
         request_push(oid, content ? true : false)
       end
 
@@ -840,6 +862,13 @@ module TeamHub
         notify
         UI.start_timer(0, false) { guard { run_jobs } }
       end
+      if obj['kind'] == 'delta'
+        when_idle do
+          guard { apply_delta(obj) }
+          done.call
+        end
+        return
+      end
       apply = lambda do |path|
         when_idle do
           guard { apply_object(obj, path) }
@@ -875,11 +904,16 @@ module TeamHub
       # A newer revision exists (often my own edit that won): this one is stale.
       return if latest && latest['rev'].to_i > obj['rev'].to_i
       return if latest && latest['updated_by'] == my_id && !obj['force'] && local_exists?(obj)
-      if editing_now?(oid) || @pushing[oid] || @push_wanted.key?(oid) || @touched[oid] || @content_dirty[oid]
-        # I'm in the middle of it: let me finish; whoever saves last wins.
+      if editing_now?(oid) || @pushing[oid] || @push_wanted.key?(oid) || @touched[oid] || @content_dirty[oid] ||
+         (obj['kind'] == 'loose' && !(@model.active_path || []).empty?)
+        # I'm in the middle of it (or inside a Group, where loose geometry
+        # would land in the wrong place): apply a moment later.
         UI.start_timer(2, false) { enqueue(obj) unless @stopped }
         return
       end
+      flush_deltas(send: true)
+      ctx = ctx_for_object(obj)
+      untrack(ctx) if ctx && !obj['meta_only']
       model_op('Team Hub: تحديث من الفريق') do
         case obj['kind']
         when 'definition' then apply_definition(obj, path)
@@ -888,8 +922,24 @@ module TeamHub
         else apply_component(obj)
         end
       end
+      flush_deltas(send: false)
+      untrack(ctx) if ctx && !obj['meta_only']
+      ensure_tracking(LOOSE_OID) if ctx == LOOSE_OID
       snapshot_fp(oid)
       refresh_overlay
+    end
+
+    def stamp_rev_later(obj)
+      when_idle do
+        model_op('Team Hub') do
+          if obj['kind'] == 'loose'
+            @model.set_attribute(DICT, 'loose_rev', obj['rev'])
+          elsif obj['kind'] == 'definition'
+            d = live_def(did_of(obj['oid']))
+            d.set_attribute(DICT, 'rev', obj['rev']) if d
+          end
+        end
+      end
     end
 
     def editing_now?(oid)

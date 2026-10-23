@@ -102,6 +102,24 @@ module TeamHub
         s && s.instance_variable_get(:@loaded) && s.status == :online && s.model == model
       end
 
+      # ------------------------------------------------------------ helpers for the v1.7 scenarios
+      def faces_at_y(g, y)
+        g.definition.entities.grep(Sketchup::Face).count do |f|
+          f.vertices.all? { |v| (v.position.y.to_f - y).abs < 0.01 }
+        end
+      end
+
+      def groups_summary
+        model.entities.grep(Sketchup::Group).map { |g| "#{g.name}@#{origin(g).inspect}" }.sort.join(' | ')
+      end
+
+      def add_wall_face(g, y)
+        # local points; while the group is open SketchUp wants model coordinates
+        tr = g.transformation
+        pts = [[500, y, 0], [520, y, 0], [520, y, 20], [500, y, 20]].map { |p| Geom::Point3d.new(*p).transform(tr) }
+        edit("face y=#{y}") { g.entities.add_face(pts) }
+      end
+
       # ------------------------------------------------------------ bot A (shares the file)
       def step_a
         case @stage
@@ -126,58 +144,57 @@ module TeamHub
           return unless seen('B:joined')
           edit('move G1') { group('G1').transform!(Geom::Transformation.new([100, 0, 0])) }
           post('A:moved_g1')
-          nxt('moved G1 by +100 x')
+          nxt('moved G1 +100 x')
         when 4
-          return unless seen('B:editing_g2')
-          @wait_lock = Time.now
-          nxt
+          return unless seen('B:saw_move')
+          edit('move G2') { group('G2').transform!(Geom::Transformation.new([1000, 0, 0])) }
+          post('A:moved_g2')
+          nxt('moved G2 +1000 x (so its own coordinates differ from the model)')
         when 5
-          g2 = group('G2')
-          if g2&.locked?
-            check(true, "G2 locked on A #{((Time.now.to_f - seen('B:editing_g2')) * 1000).round} ms after B opened it (B is editing it)")
-            edit('move G1 again') { group('G1').transform!(Geom::Transformation.new([0, 100, 0])) }
-            post('A:moved_g1_again')
-            nxt('moved G1 by +100 y while B is inside G2')
-          elsif since > 6
-            check(false, 'G2 never got locked on A while B edited it')
-            post('A:moved_g1_again')
-            nxt
-          end
+          return unless seen('B:ready')
+          model.active_path = [group('G2')]
+          post('A:in_g2')
+          nxt('opened G2')
         when 6
-          return unless seen('B:done_g2')
-          g2 = group('G2')
-          faces = g2 ? g2.entities.grep(Sketchup::Face).size : 0
-          return if since < 25 && (g2.nil? || faces < 7 || g2.locked?)
-          check(g2 && faces >= 7, "B's edit inside G2 arrived (faces=#{faces})")
-          check(g2 && !g2.locked?, 'G2 unlocked on A after B finished')
-          check(g2 && origin(g2) == [0.0, 0.0, 0.0], "G2 did not teleport on A (origin #{g2 && origin(g2).inspect})")
-          check(origin(group('G1')) == [100.0, 100.0, 0.0], "G1 where A put it (#{origin(group('G1')).inspect})")
-          nxt
+          return unless seen('B:in_g2')
+          add_wall_face(group('G2'), 60)
+          post('A:drew')
+          nxt('drew a face inside G2 (y=60) while B is drawing in it too')
         when 7
-          post('A:conflict_go')
-          edit('A moves G1 in conflict') { group('G1').transform!(Geom::Transformation.new([0, 0, 50])) }
-          nxt('conflict: moved G1 +50 z at the same time as B')
-        when 8
-          return if since < 12
-          groups = model.entities.grep(Sketchup::Group).map { |g| "#{g.name}@#{origin(g).inspect}" }
-          log("after conflict, groups on A: #{groups.join(' | ')}")
+          return unless seen('B:drew') && since > 4
+          model.active_path = nil
+          g2 = group('G2')
+          check(faces_at_y(g2, 60) == 1 && faces_at_y(g2, 80) == 1,
+                "both drawings inside the same G2 are on A (mine y=60: #{faces_at_y(g2, 60)}, B's y=80: #{faces_at_y(g2, 80)})")
+          check(model.entities.grep(Sketchup::Group).size == 2, "no copies on A (#{groups_summary})")
+          post('A:checked')
           nxt
+        when 8
+          return unless seen('B:checked')
+          model.active_path = [group('G2')]
+          post('A:in_g2_again')
+          nxt('opened G2 again (B will draw a loose line now)')
         when 9
-          return unless seen('B:drew_line')
-          edges = model.entities.grep(Sketchup::Edge).size
-          return if edges.zero? && since < 15
-          check(edges.positive?, "B's loose line arrived on A #{((Time.now.to_f - seen('B:drew_line')) * 1000).round} ms after B drew it (edges=#{edges})")
+          return unless seen('B:drew_line') && since > 3
+          model.active_path = nil
+          e = model.entities.grep(Sketchup::Edge).find { |x| (x.start.position.y.to_f + 200).abs < 0.01 }
+          pts = e ? [e.start.position, e.end.position].map { |p| [p.x.to_f.round(2), p.y.to_f.round(2), p.z.to_f.round(2)] }.sort : nil
+          check(pts == [[0.0, -200.0, 0.0], [300.0, -200.0, 0.0]],
+                "B's loose line landed at the same place on A, though A was inside G2 (#{pts.inspect})")
           nxt
         when 10
-          edit('move G2 #1') { group('G2').transform!(Geom::Transformation.new([10, 0, 0])) }
-          nxt
+          post('A:conflict_go')
+          edit('A moves G1') { group('G1').transform!(Geom::Transformation.new([0, 0, 50])) }
+          nxt('moved G1 +50 z at the same moment as B')
         when 11
-          return if since < 3
-          edit('move G2 #2') { group('G2').transform!(Geom::Transformation.new([10, 0, 0])) }
-          post('A:moved_g2')
-          nxt('moved G2 twice (second move = position only)')
+          return if since < 12
+          check(model.entities.grep(Sketchup::Group).size == 2, "no copies after both moved G1 (#{groups_summary})")
+          post("A:final=#{groups_summary}")
+          nxt
         when 12
-          return if since < 4
+          b = bus.keys.find { |k| k.start_with?('B:final=') }
+          return unless b || since > 10
+          check(b && b.sub('B:final=', '') == groups_summary, "A and B ended identical: #{groups_summary}")
           log("ping A→server: #{TeamHub.session.ping_ms.inspect} ms")
           log('DONE')
           @stage = -1
@@ -204,46 +221,44 @@ module TeamHub
         when 3
           return unless (t = seen('A:moved_g1'))
           return unless origin(group('G1')) == [100.0, 0.0, 0.0]
-          check(true, "A's move of G1 arrived on B #{((Time.now.to_f - t) * 1000).round} ms after A moved it")
+          check(true, "A's move of G1 arrived on B #{((Time.now.to_f - t) * 1000).round} ms later")
           post('B:saw_move')
           nxt
         when 4
-          g2 = group('G2')
-          model.active_path = [g2]
-          edit('B edits inside G2') { g2.entities.add_face([520, 10, 50], [540, 10, 50], [540, 10, 80], [520, 10, 80]) }
-          post('B:editing_g2')
-          nxt('opened G2 and added a face inside it')
+          return unless (t = seen('A:moved_g2'))
+          return unless origin(group('G2')) == [1000.0, 0.0, 0.0]
+          check(true, "A's move of G2 arrived on B #{((Time.now.to_f - t) * 1000).round} ms later")
+          post('B:ready')
+          nxt
         when 5
-          return unless seen('A:moved_g1_again') && since > 3
-          model.active_path = nil
-          post('B:done_g2')
-          nxt('closed G2')
+          return unless seen('A:in_g2')
+          model.active_path = [group('G2')]
+          post('B:in_g2')
+          add_wall_face(group('G2'), 80)
+          post('B:drew')
+          nxt('opened G2 and drew a face (y=80) at the same time as A')
         when 6
-          return if since < 4
-          check(origin(group('G1')) == [100.0, 100.0, 0.0], "G1 on B where A put it, received while B was inside G2 (#{origin(group('G1')).inspect})")
-          check(origin(group('G2')) == [0.0, 0.0, 0.0], "G2 did not teleport on B (#{origin(group('G2')).inspect})")
+          return unless seen('A:drew') && since > 4
+          model.active_path = nil
+          g2 = group('G2')
+          check(faces_at_y(g2, 60) == 1 && faces_at_y(g2, 80) == 1,
+                "both drawings inside the same G2 are on B (A's y=60: #{faces_at_y(g2, 60)}, mine y=80: #{faces_at_y(g2, 80)})")
+          check(model.entities.grep(Sketchup::Group).size == 2, "no copies on B (#{groups_summary})")
+          post('B:checked')
           nxt
         when 7
-          return unless seen('A:conflict_go')
-          g1 = group('G1')
-          g1.locked = false
-          edit('B moves G1 in conflict') { g1.transform!(Geom::Transformation.new([1000, 0, 0])) }
-          nxt('conflict: moved G1 +1000 x at the same time as A')
-        when 8
-          return if since < 12
-          groups = model.entities.grep(Sketchup::Group).map { |g| "#{g.name}@#{origin(g).inspect}" }
-          log("after conflict, groups on B: #{groups.join(' | ')}")
-          nxt
-        when 9
-          edit('B draws a loose line') { model.entities.add_line([0, -200, 0], [300, -200, 0]) }
+          return unless seen('A:in_g2_again')
+          edit('loose line') { model.entities.add_line([0, -200, 0], [300, -200, 0]) }
           post('B:drew_line')
-          nxt('drew a loose line')
-        when 10
-          return unless (t = seen('A:moved_g2'))
-          return unless origin(group('G2')) == [20.0, 0.0, 0.0]
-          check(true, "A's second move of G2 (position only) arrived on B #{((Time.now.to_f - t) * 1000).round} ms after A moved it")
-          nxt
-        when 11
+          nxt('drew a loose line while A is inside G2')
+        when 8
+          return unless seen('A:conflict_go')
+          edit('B moves G1') { group('G1').transform!(Geom::Transformation.new([1000, 0, 0])) }
+          nxt('moved G1 +1000 x at the same moment as A')
+        when 9
+          return if since < 12
+          check(model.entities.grep(Sketchup::Group).size == 2, "no copies after both moved G1 (#{groups_summary})")
+          post("B:final=#{groups_summary}")
           log("ping B→server: #{TeamHub.session.ping_ms.inspect} ms")
           log('DONE')
           @stage = -1
