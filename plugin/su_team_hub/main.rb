@@ -9,6 +9,7 @@ require 'su_team_hub/realtime'
 require 'su_team_hub/delta'
 require 'su_team_hub/ws'
 require 'su_team_hub/live_ws'
+require 'su_team_hub/reliable'
 require 'su_team_hub/selftest'
 require 'su_team_hub/overlay'
 require 'su_team_hub/panel'
@@ -25,6 +26,7 @@ module TeamHub
 
     def log_error(e)
       puts "[Team Hub] #{e.class}: #{e.message}\n  #{Array(e.backtrace).first(6).join("\n  ")}"
+      log_sync("ERROR #{e.class}: #{e.message} @ #{Array(e.backtrace).first(3).join(' < ')}") if respond_to?(:log_sync)
     end
 
     def pref(key, default = nil)
@@ -333,6 +335,7 @@ module TeamHub
       when 'sync_now' then s&.sync_now
       when 'dashboard' then UI.openURL(pref('server', ''))
       when 'update_plugin' then install_update
+      when 'send_log' then send_log
       end
       panel_refresh
     rescue StandardError => e

@@ -71,6 +71,11 @@ module TeamHub
       body = { 'kind' => 'loose', 'name' => 'خطوط وسطوح سائبة', 'layer' => '', 'meta' => { 'empty' => list.empty? } }
       body['base_rev'] = loose_rev if @objects[LOOSE_OID] && !@objects[LOOSE_OID]['deleted']
       body['data'] = list.empty? ? ['EMPTY'].pack('m0') : export_loose
+      body['meta']['lt'] = @loose_export_t if @loose_export_t
+      body['meta']['bb'] = @loose_export_bb if @loose_export_bb
+      sh = object_sighash(LOOSE_OID)
+      body['meta']['sighash'] = sh if sh
+      TeamHub.log_sync("PUSH loose (#{list.size} entities) base r#{body['base_rev'].inspect}")
       @pushing[LOOSE_OID] = true
       notify
       @client.request(:post, "/api/projects/#{pid}/objects/#{LOOSE_OID}", body, timeout: 600) do |st, data|
@@ -85,6 +90,8 @@ module TeamHub
         elsif st.zero?
           @status = :offline
           @push_wanted[LOOSE_OID] = true
+        elsif st == 409 || (st == 423 && data && data['error'] == 'being_edited')
+          when_idle { lost_race(LOOSE_OID, data) }
         elsif st == 423
           TeamHub.flash('الخطوط السائبة محجوزة من عضو ثاني')
         end
@@ -102,6 +109,11 @@ module TeamHub
       @model.start_operation('Team Hub export', true)
       begin
         g = @model.entities.add_group(loose_entities)
+        # SketchUp puts a new group's origin at the corner of its contents:
+        # remember that offset (and the contents' box) so the other side can
+        # place the lines at exactly the same x, y, z.
+        @loose_export_t = g.transformation.to_a
+        @loose_export_bb = bbox_a(g.definition.bounds)
         ok = TeamHub.save_definition(g.definition, out)
       ensure
         @model.abort_operation
@@ -116,11 +128,24 @@ module TeamHub
 
     def apply_loose(obj, path)
       old = loose_entities
+      # Lines I drew that haven't reached the server yet must never be wiped
+      # by someone else's version: they become my own Group first.
+      mine = @loose_ids ? old.reject { |e| @loose_ids[e.entityID] } : []
+      if !mine.empty? && obj['updated_by'] != my_id
+        g = @model.entities.add_group(mine)
+        g.name = "رسمة #{@me['display_name']}"
+        @added << g
+        TeamHub.log_sync("KEEP #{mine.size} unsent loose entities as my group before applying loose r#{obj['rev']}")
+        UI.start_timer(0, false) { guard { process_added } }
+        old = loose_entities
+      end
       old.each { |e| e.locked = false if e.respond_to?(:locked=) && e.respond_to?(:locked?) && e.locked? }
       @model.entities.erase_entities(old) unless old.empty?
-      unless (obj['meta'] || {})['empty'] || path.nil?
-        defn = load_definition(path)
-        @model.entities.add_instance(defn, IDENTITY).explode
+      meta = obj['meta'] || {}
+      unless meta['empty'] || path.nil?
+        defn = load_definition(path, meta['bb'])
+        place = meta['lt'].is_a?(Array) && meta['lt'].size == 16 ? Geom::Transformation.new(meta['lt']) : IDENTITY
+        @model.entities.add_instance(defn, place).explode
         remove_definitions([defn])
       end
       @model.set_attribute(DICT, 'loose_rev', obj['rev'])

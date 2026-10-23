@@ -21,6 +21,10 @@ require 'digest'
 
 module TeamHub
   class Session
+    # OFF since 2.0: replaying single operations let the two models drift apart
+    # (SketchUp splits/merges geometry differently on each side) → deleted and
+    # duplicated shapes. Whole objects travel instead, one editor at a time.
+    DELTA_ENABLED = false
     DELTA_LIVE_SECS = 90     # after a delta, checkpoints don't replace that context
     CHECKPOINT_EVERY = 30    # while editing live, a full copy goes up at most this often
 
@@ -149,6 +153,7 @@ module TeamHub
     end
 
     def delta_live?(ctx)
+      return false unless DELTA_ENABLED
       t = delta_live[ctx]
       t && Time.now - t < DELTA_LIVE_SECS
     end
@@ -165,6 +170,7 @@ module TeamHub
     end
 
     def ensure_tracking(ctx)
+      return nil unless DELTA_ENABLED
       return dtrack[ctx] if tracking_valid?(dtrack[ctx])
       untrack(ctx)
       coll = ctx_entities(ctx)
@@ -215,6 +221,10 @@ module TeamHub
     # Turn recorded changes into a delta (and keep the signature maps right).
     # send=false after applying a teammate's delta: only update the maps.
     def flush_deltas(send:)
+      unless DELTA_ENABLED
+        @dchanges = {}
+        return
+      end
       return if dchanges.empty?
       list = dchanges
       @dchanges = {}
@@ -288,6 +298,7 @@ module TeamHub
     # ------------------------------------------------------------ receiving
 
     def enqueue_delta(payload, user)
+      return unless DELTA_ENABLED
       @jobs << { 'oid' => "delta:#{SecureRandom.hex(4)}", 'kind' => 'delta', 'delta' => payload, 'user' => user }
       run_jobs
     end

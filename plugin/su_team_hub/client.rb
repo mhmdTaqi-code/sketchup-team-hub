@@ -32,7 +32,8 @@ module TeamHub
     # Calls the block with (status, data). status 0 = network failure/timeout.
     def request(method, path, body = nil, timeout: 30, &block)
       req = Sketchup::Http::Request.new(@server + path, METHODS.fetch(method))
-      headers = { 'Content-Type' => 'application/json', 'Accept' => 'application/json' }
+      headers = { 'Content-Type' => 'application/json', 'Accept' => 'application/json',
+                  'X-TeamHub-Plugin' => PLUGIN_VERSION }
       headers['Authorization'] = "Bearer #{@token}" if @token
       req.headers = headers
       req.body = JSON.generate(body) if body

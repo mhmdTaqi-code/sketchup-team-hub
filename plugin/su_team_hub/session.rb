@@ -98,7 +98,7 @@ module TeamHub
     end
     # Everyone edits everything; a reservation is optional and only blocks others.
     def mine?(oid)
-      !viewer? && (@locks[oid].nil? || @locks[oid] == my_id)
+      !viewer? && (@locks[oid].nil? || @locks[oid] == my_id) && !claimed_by_other?(oid)
     end
     def reserved_by_me?(oid)
       @locks[oid] == my_id
@@ -126,6 +126,7 @@ module TeamHub
       @model.add_observer(@model_obs)
       @model.entities.add_observer(@ents_obs)
       @model.tools.add_observer(@tools_obs)
+      attach_selection_observer
       @overlay = TeamHub.attach_overlay(@model, self)
       load_state
     end
@@ -145,6 +146,7 @@ module TeamHub
         nil
       end
       untrack_all
+      detach_selection_observer
       stop_ws
       TeamHub.detach_overlay(@model, @overlay)
       @model.active_view.invalidate rescue nil
@@ -427,7 +429,7 @@ module TeamHub
       return unless oid
       @touched[oid] = true
       (ctx = ctx_of_root(root)) && ensure_tracking(ctx)
-      blocked = reserved_by_other?(oid) ? oid : nil
+      blocked = (reserved_by_other?(oid) || claimed_by_other?(oid)) ? oid : nil
       unless blocked
         note_activity(oid) do |holder|
           UI.start_timer(0, false) { @model.close_active rescue nil }
@@ -436,7 +438,7 @@ module TeamHub
       end
       if !blocked && root.is_a?(Sketchup::ComponentInstance)
         did = root.definition.get_attribute(DICT, 'did')
-        blocked = "d_#{did}" if did && reserved_by_other?("d_#{did}")
+        blocked = "d_#{did}" if did && (reserved_by_other?("d_#{did}") || claimed_by_other?("d_#{did}"))
       end
       return unless blocked
       holder = @users[@locks[blocked]] || {}
@@ -529,8 +531,9 @@ module TeamHub
           changed = (@meta_fp.key?(oid) && @meta_fp[oid] != meta_fp(ent)) ||
                     (@content_fp.key?(oid) && @content_fp[oid] != content_fp(ent))
           if changed
-            holder = @users[@locks[oid]] || {}
-            TeamHub.flash("«#{display_name(ent)}» محجوز من #{holder['display_name'] || 'عضو ثاني'}، رجّعته مثل ما جان.")
+            holder = @users[@locks[oid] || claims[oid]] || {}
+            TeamHub.log_sync("REVERT #{oid} changed while #{holder['display_name']} has it")
+            TeamHub.flash("«#{display_name(ent)}» يعدّل عليه #{holder['display_name'] || 'عضو ثاني'} هسه، فرجّعته مثل ما جان. انتظر يخلص.")
             server = @objects[oid]
             enqueue(server.merge('force' => true)) if server && !server['deleted']
             snapshot_fp(oid)
@@ -731,7 +734,7 @@ module TeamHub
         server = @objects[oid]
         body = {
           'kind' => 'definition', 'name' => d.name, 'layer' => '',
-          'meta' => { 'name' => d.name, 'description' => d.description },
+          'meta' => { 'name' => d.name, 'description' => d.description, 'bb' => bbox_a(d.bounds) },
           'data' => export_definition(d),
         }
         fp = defn_fp(d)
@@ -760,6 +763,7 @@ module TeamHub
         end
         # 'name' is the label everyone sees; meta.iname is the entity's own name.
         body = { 'kind' => kind, 'name' => display_name(ent), 'layer' => ent.layer.name, 'meta' => meta }
+        meta['bb'] = bbox_a(ent.definition.bounds) if kind == 'group'
         if kind == 'group' && (content || server.nil? || server['deleted'] || server['blob'].nil?)
           body['data'] = export_definition(ent.definition)
         end
@@ -767,6 +771,10 @@ module TeamHub
         mfp = meta_fp(ent)
       end
       body['base_rev'] = local_rev('oid' => oid, 'kind' => oid.start_with?('d_') ? 'definition' : 'object') if server && !server['deleted']
+      if body['data'] && (sh = object_sighash(oid))
+        body['meta'] = (body['meta'] || {}).merge('sighash' => sh)
+      end
+      TeamHub.log_sync("PUSH #{oid} #{body['kind']} #{body['data'] ? "contents #{body['data'].size}b64" : 'position'} base r#{body['base_rev'].inspect}")
 
       @pushing[oid] = true
       notify
@@ -784,6 +792,7 @@ module TeamHub
       when 200
         obj = data['object']
         @objects[oid] = obj
+        TeamHub.log_sync("PUSHED #{oid} → r#{obj['rev']}")
         @new_local.delete(oid)
         @meta_fp[oid] = mfp if mfp
         @content_fp[oid] = fp if fp
@@ -806,8 +815,7 @@ module TeamHub
         end
       when 423, 409
         if st == 409 || (data && data['error'] == 'being_edited')
-          @new_local.delete(oid)
-          keep_both(oid, data && data['user'])
+          lost_race(oid, data)
           return
         end
         @new_local.delete(oid)
@@ -928,6 +936,7 @@ module TeamHub
       flush_deltas(send: true)
       ctx = ctx_for_object(obj)
       untrack(ctx) if ctx && !obj['meta_only']
+      TeamHub.log_sync("APPLY #{oid} #{obj['kind']} r#{obj['rev']}#{obj['meta_only'] ? ' position' : ''}#{obj['deleted'] ? ' DELETE' : ''} from u#{obj['updated_by']}")
       model_op('Team Hub: تحديث من الفريق') do
         case obj['kind']
         when 'definition' then apply_definition(obj, path)
@@ -940,7 +949,19 @@ module TeamHub
       untrack(ctx) if ctx && !obj['meta_only']
       ensure_tracking(LOOSE_OID) if ctx == LOOSE_OID
       snapshot_fp(oid)
+      if obj['kind'] == 'definition' && (d = live_def(did_of(oid)))
+        d.instances.each { |i| (io = @eid_to_oid[i.entityID]) && snapshot_fp(io) }
+      end
+      verify_applied(obj)
       refresh_overlay
+    end
+
+    def verify_applied(obj)
+      want = (obj['meta'] || {})['sighash']
+      return unless want && !obj['meta_only'] && !obj['deleted']
+      have = object_sighash(obj['oid'])
+      return if have.nil?
+      TeamHub.log_sync("VERIFY #{obj['oid']} r#{obj['rev']} contents #{have == want ? 'OK' : "MISMATCH #{have[0, 8]} != #{want[0, 8]}"}")
     end
 
     def stamp_rev_later(obj)
@@ -990,7 +1011,7 @@ module TeamHub
         end
         return
       end
-      newdef = load_definition(path)
+      newdef = load_definition(path, (obj['meta'] || {})['bb'])
       @def_index[did] = newdef
       if old && old != newdef
         nested = nested_definitions(old)
@@ -1032,7 +1053,7 @@ module TeamHub
         erase_tracked(old)
         return
       end
-      defn = load_definition(path)
+      defn = load_definition(path, (obj['meta'] || {})['bb'])
       grp = @model.entities.add_group
       grp.entities.add_instance(defn, IDENTITY).explode
       remove_definitions([defn])
@@ -1127,11 +1148,16 @@ module TeamHub
       end
     end
 
-    def load_definition(path)
+    def bbox_a(bb)
+      bb.empty? ? nil : [bb.min.to_a, bb.max.to_a].map { |p| p.map { |v| v.to_f.round(6) } }
+    end
+
+    def load_definition(path, expect_bb = nil)
       tmp = File.join(@temp, "load_#{SecureRandom.hex(6)}.skp")
       FileUtils.cp(path, tmp)
       defn = @model.definitions.load(tmp)
       raise 'تعذر فتح ملف العنصر' unless defn
+      align_definition(defn, expect_bb)
       defn
     ensure
       begin
@@ -1139,6 +1165,23 @@ module TeamHub
       rescue StandardError
         nil
       end
+    end
+
+    # The sender told us where the contents sit (box min/max in x, y, z). If the
+    # loaded copy sits anywhere else, move it back exactly; then double-check.
+    def align_definition(defn, expect_bb)
+      return unless expect_bb.is_a?(Array) && expect_bb.size == 2
+      have = defn.bounds
+      return if have.empty?
+      want_min = Geom::Point3d.new(*expect_bb[0])
+      delta = want_min - have.min
+      if delta.length > 0.0001
+        defn.entities.transform_entities(Geom::Transformation.translation(delta), defn.entities.to_a)
+        TeamHub.log_sync("ALIGN #{defn.name}: contents were off by #{delta.to_a.map { |v| v.to_f.round(3) }.inspect}, moved back")
+      end
+      got = bbox_a(defn.bounds)
+      ok = got && got.flatten.zip(expect_bb.flatten).all? { |a, b| (a - b).abs < 0.001 }
+      TeamHub.log_sync("VERIFY #{defn.name} box #{ok ? 'OK' : "MISMATCH have #{got.inspect} want #{expect_bb.inspect}"}")
     end
 
     # ------------------------------------------------------------ locks
@@ -1271,6 +1314,7 @@ module TeamHub
         @index.each_key { |o| @touched[o] = true }
         @loose_dirty = true
         scan
+        heal_step
       end
     end
 

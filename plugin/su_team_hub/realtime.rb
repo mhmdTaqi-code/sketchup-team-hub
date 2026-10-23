@@ -87,6 +87,9 @@ module TeamHub
         tick_claims(now)
         return
       end
+      # watchdog: the socket is down and no retry is on its way (e.g. the
+      # server restarted while a retry was failing) → try again
+      start_ws if (@ws.nil? || @ws.state == :closed) && (@ws_tried_at.nil? || now - @ws_tried_at > WS_RETRY * 2)
       if @last_ping_at.nil? || now - @last_ping_at >= PING_EVERY
         @last_ping_at = now
         t0 = Time.now

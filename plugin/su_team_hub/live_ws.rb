@@ -18,6 +18,7 @@ module TeamHub
 
     def start_ws
       return if @stopped || (@ws && @ws.state != :closed)
+      @ws_tried_at = Time.now
       @ws = WSConn.new(ws_url,
                        on_open: -> { guard { ws_opened } },
                        on_message: ->(m) { guard { ws_message(m) } },
@@ -41,7 +42,8 @@ module TeamHub
       notify
     end
 
-    def ws_closed(_why)
+    def ws_closed(why)
+      TeamHub.log_sync("WS closed: #{why}") if why && @transport == :websocket || why.to_s =~ /Error|Errno/
       @transport = :longpoll
       requeue_inflight_deltas
       return if @stopped

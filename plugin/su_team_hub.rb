@@ -1,4 +1,4 @@
-# SketchUp Team Hub — shared-project collaboration for a SketchUp team.
+# SketchUp Team Hub â€” shared-project collaboration for a SketchUp team.
 # Loader: registers the extension; the code lives in su_team_hub/.
 
 require 'sketchup.rb'
@@ -6,7 +6,7 @@ require 'extensions.rb'
 
 module TeamHub
   PLUGIN_ID = 'su_team_hub'.freeze
-  PLUGIN_VERSION = '1.8.0'.freeze
+  PLUGIN_VERSION = '2.0.0'.freeze
 
   unless file_loaded?(__FILE__)
     ext = SketchupExtension.new('Team Hub', File.join(PLUGIN_ID, 'main'))

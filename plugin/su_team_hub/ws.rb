@@ -35,7 +35,10 @@ module TeamHub
     def start
       host = @uri.host
       port = @uri.port || 80
-      addr = Socket.sockaddr_in(port, host)
+      # IPv4 only: "localhost" can resolve to ::1 first, which an AF_INET
+      # socket can't connect to (the server listens on 0.0.0.0)
+      ip = host == 'localhost' ? '127.0.0.1' : Addrinfo.getaddrinfo(host, port, :INET, :STREAM).first.ip_address
+      addr = Socket.sockaddr_in(port, ip)
       @sock = Socket.new(Socket::AF_INET, Socket::SOCK_STREAM, 0)
       @sock.setsockopt(Socket::IPPROTO_TCP, Socket::TCP_NODELAY, 1)
       @state = :connecting

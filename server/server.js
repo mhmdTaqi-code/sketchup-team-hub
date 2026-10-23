@@ -251,6 +251,23 @@ function createUser({ username, display_name, password, role }) {
   return q.userById.get(Number(r.lastInsertRowid));
 }
 
+// Plugins older than this may not write (mixed versions corrupt the model).
+const MIN_WRITER_PLUGIN = '2.0.0';
+
+function versionLess(a, b) {
+  const pa = String(a || '0').split('.').map(Number);
+  const pb = String(b || '0').split('.').map(Number);
+  for (let i = 0; i < 3; i++) { if ((pa[i] || 0) !== (pb[i] || 0)) return (pa[i] || 0) < (pb[i] || 0); }
+  return false;
+}
+
+function requireCurrentPlugin(ctx) {
+  const v = ctx.req.headers['x-teamhub-plugin'];
+  if (versionLess(v, MIN_WRITER_PLUGIN)) {
+    throw httpError(426, 'update_required', { min: MIN_WRITER_PLUGIN, message: 'حدّث بلكن Team Hub من لوحة الفريق (زر تحديث) وأعد فتح SketchUp' });
+  }
+}
+
 function authenticate(req, url) {
   let token = null;
   const h = req.headers['authorization'];
@@ -562,10 +579,18 @@ function writeObject(pid, user, oid, body) {
     const obj = q.object.get(pid, oid);
     const lock = q.lock.get(pid, oid);
     const live = obj && !obj.deleted;
-    // Anyone may edit anything; a reservation (optional) blocks everyone else.
-    // Without one, the last write wins.
+    // One editor at a time per object: a reservation, or someone currently
+    // working on it (live claim), blocks everyone else.
     if (lock && lock.user_id !== user.id) {
       throw httpError(423, 'locked_by_other', { user: userBrief(lock.user_id) });
+    }
+    const claim = claimOf(pid, oid);
+    if (claim && claim.user_id !== user.id) {
+      throw httpError(423, 'being_edited', { user: userBrief(claim.user_id) });
+    }
+    // Never overwrite a newer version someone else saved: the client takes theirs.
+    if (live && body.base_rev != null && Number(body.base_rev) < obj.rev && obj.updated_by !== user.id) {
+      throw httpError(409, 'conflict', { rev: obj.rev, user: userBrief(obj.updated_by) });
     }
     let blob = obj ? obj.blob : null;
     let size = obj ? obj.size : null;
@@ -602,6 +627,10 @@ function deleteObject(pid, user, oid, baseRev) {
     const lock = q.lock.get(pid, oid);
     if (lock && lock.user_id !== user.id) {
       throw httpError(423, 'locked_by_other', { user: userBrief(lock.user_id) });
+    }
+    const claim = claimOf(pid, oid);
+    if (claim && claim.user_id !== user.id) {
+      throw httpError(423, 'being_edited', { user: userBrief(claim.user_id) });
     }
     if (!obj) {
       // Never changed since the shared file was handed out: record the deletion
@@ -827,8 +856,20 @@ route('PATCH', '/api/projects/:pid', async (ctx) => {
 
 route('GET', '/api/ping', () => ({ t: now() }));
 
+// "Send log" button in the plugin: the last part of its sync log, kept per user.
+route('POST', '/api/logs', async (ctx) => {
+  requireRole(ctx.user, 'admin', 'editor', 'viewer');
+  const b = await readJson(ctx.req);
+  const dir = path.join(DATA_DIR, 'logs');
+  fs.mkdirSync(dir, { recursive: true });
+  const name = `${ctx.user.username}_${new Date().toISOString().replace(/[:.]/g, '-')}.log`;
+  fs.writeFileSync(path.join(dir, name), String(b.text || '').slice(-2_000_000));
+  return { ok: true, file: name };
+});
+
 route('POST', '/api/projects/:pid/delta', async (ctx) => {
   requireRole(ctx.user, 'admin', 'editor');
+  requireCurrentPlugin(ctx);
   const p = getProject(ctx.params.pid);
   const b = await readJson(ctx.req);
   const target = String(b.ctx || '');
@@ -866,8 +907,8 @@ route('POST', '/api/projects/:pid/claim', async (ctx) => {
   for (const oid of oids) {
     const lock = q.lock.get(p.id, oid);
     const c = claimOf(p.id, oid);
-    // Only a reservation blocks; several people can be "editing" the same thing.
-    const blocker = (lock && lock.user_id !== ctx.user.id) ? lock.user_id : null;
+    // A reservation or someone else already working on it blocks the claim.
+    const blocker = (lock && lock.user_id !== ctx.user.id) ? lock.user_id : (c && c.user_id !== ctx.user.id) ? c.user_id : null;
     if (blocker) { denied.push({ oid, user: userBrief(blocker) }); continue; }
     if (!c || c.user_id !== ctx.user.id) fresh.push(oid);
     claims.set(`${p.id}:${oid}`, { user_id: ctx.user.id, until: t + CLAIM_MS });
@@ -971,6 +1012,7 @@ route('POST', '/api/projects/:pid/unlock', async (ctx) => {
 
 route('POST', '/api/projects/:pid/objects/:oid', async (ctx) => {
   requireRole(ctx.user, 'admin', 'editor');
+  requireCurrentPlugin(ctx);
   const p = getProject(ctx.params.pid);
   const b = await readJson(ctx.req);
   return { object: writeObject(p.id, ctx.user, ctx.params.oid, b) };
@@ -978,6 +1020,7 @@ route('POST', '/api/projects/:pid/objects/:oid', async (ctx) => {
 
 route('DELETE', '/api/projects/:pid/objects/:oid', (ctx) => {
   requireRole(ctx.user, 'admin', 'editor');
+  requireCurrentPlugin(ctx);
   const p = getProject(ctx.params.pid);
   return { object: deleteObject(p.id, ctx.user, ctx.params.oid, ctx.url.searchParams.get('base_rev')) };
 });
@@ -1044,6 +1087,7 @@ function sharedFileInfo(p) {
 
 route('POST', '/api/projects/:pid/file/chunk', async (ctx) => {
   requireRole(ctx.user, 'admin', 'editor');
+  requireCurrentPlugin(ctx);
   const p = getProject(ctx.params.pid);
   const b = await readJson(ctx.req);
   const index = Number(b.index);
@@ -1457,7 +1501,7 @@ server.on('upgrade', (req, socket, head) => {
       } else if (msg.type === 'delta') {
         // Live geometry operation over the open socket (no HTTP round trip).
         let reply;
-        try { reply = { type: 'ack', id: msg.id ?? null, ...applyDelta(pid, c.user, msg) }; }
+        try { throw httpError(426, 'update_required'); }
         catch (e) { reply = { type: 'ack', id: msg.id ?? null, ok: false, status: e.status || 500, error: e.code || e.message, user: e.extra?.user }; }
         ws.send(JSON.stringify(reply));
       }
