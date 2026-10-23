@@ -1,0 +1,11 @@
+# Server runtime data — your projects, accounts and backups. Never commit.
+server/data/
+server/config.json
+server/node_modules/
+# Build outputs (published as GitHub Release assets instead)
+server/plugin/
+dist/
+bin/
+obj/
+*.user
+.vs/

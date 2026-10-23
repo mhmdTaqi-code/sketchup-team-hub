@@ -1,0 +1,390 @@
+<!doctype html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="utf-8">
+<title>Team Hub</title>
+<style>
+  :root {
+    --bg: #f4f5f7; --surface: #fff; --text: #1c1f24; --muted: #6b7280; --border: #e3e6ea;
+    --accent: #c2410c; --ok: #15803d; --ok-soft: #e8f6ec; --warn: #b45309; --warn-soft: #fff6e5;
+    --danger: #b91c1c; --danger-soft: #fdecec;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #17191d; --surface: #202329; --text: #e8eaed; --muted: #9aa1ab; --border: #31363e;
+      --accent: #fb923c; --ok: #4ade80; --ok-soft: #13261a; --warn: #fbbf24; --warn-soft: #2a2110;
+      --danger: #f87171; --danger-soft: #2c1616; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 13px/1.5 "Segoe UI", Tahoma, sans-serif; background: var(--bg); color: var(--text); }
+  .hidden { display: none !important; }
+  .muted { color: var(--muted); }
+  .wrap { padding: 12px; display: flex; flex-direction: column; gap: 10px; }
+  .card { background: var(--surface); border: 1px solid var(--border); border-radius: 9px; padding: 12px; }
+  h2 { font-size: 15px; margin: 0 0 8px; }
+  h3 { font-size: 13px; margin: 0 0 8px; color: var(--muted); font-weight: 600; }
+  label { display: flex; flex-direction: column; gap: 3px; color: var(--muted); font-size: 12px; margin-bottom: 8px; }
+  input { font: inherit; color: var(--text); background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 7px 9px; width: 100%; }
+  input:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+  button { font: inherit; cursor: pointer; border: 1px solid var(--border); background: var(--surface); color: var(--text);
+    border-radius: 6px; padding: 6px 10px; }
+  button:hover { border-color: var(--accent); }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button.small { padding: 2px 8px; font-size: 12px; }
+  button.link { border: 0; background: none; color: var(--accent); padding: 0; }
+  .row { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+  .row > .grow { flex: 1; min-width: 0; }
+  .grid3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 6px; }
+  .grid3 button { padding: 8px 4px; }
+  .head { display: flex; align-items: center; gap: 8px; }
+  .brand { font-weight: 700; }
+  .brand b { color: var(--accent); }
+  .pill { font-size: 11px; padding: 1px 8px; border-radius: 99px; white-space: nowrap; }
+  .pill.online { background: var(--ok-soft); color: var(--ok); }
+  .pill.offline { background: var(--danger-soft); color: var(--danger); }
+  .pill.connecting { background: var(--warn-soft); color: var(--warn); }
+  .warn { background: var(--warn-soft); color: var(--warn); border-radius: 7px; padding: 8px 10px; font-size: 12px; }
+  .dot { width: 9px; height: 9px; border-radius: 50%; display: inline-block; flex: none; }
+  ul { list-style: none; margin: 0; padding: 0; }
+  li.item { display: flex; gap: 8px; align-items: center; padding: 6px 0; border-bottom: 1px solid var(--border); }
+  li.item:last-child { border-bottom: 0; }
+  .name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; cursor: pointer; }
+  .name:hover { color: var(--accent); }
+  .sub { font-size: 11px; color: var(--muted); }
+  .tag { font-size: 11px; padding: 1px 7px; border-radius: 99px; background: var(--bg); display: inline-flex; gap: 4px; align-items: center; white-space: nowrap; }
+  .tabs { display: flex; gap: 2px; border-bottom: 1px solid var(--border); margin: -4px -12px 8px; padding: 0 8px; }
+  .tabs button { border: 0; background: none; border-bottom: 2px solid transparent; border-radius: 0; color: var(--muted); padding: 6px 10px; }
+  .tabs button.active { color: var(--text); border-bottom-color: var(--accent); }
+  .filters { display: flex; gap: 4px; margin-bottom: 6px; flex-wrap: wrap; }
+  .filters button { font-size: 11px; padding: 2px 8px; border-radius: 99px; }
+  .filters button.active { background: var(--accent); color: #fff; border-color: var(--accent); }
+  .scroll { max-height: 340px; overflow-y: auto; }
+  .chat { max-height: 300px; overflow-y: auto; display: flex; flex-direction: column; gap: 6px; margin-bottom: 8px; }
+  .msg { background: var(--bg); border-radius: 7px; padding: 6px 9px; }
+  .msg time, .feed time { font-size: 11px; color: var(--muted); }
+  .feed li { padding: 5px 0; border-bottom: 1px solid var(--border); display: flex; gap: 6px; }
+  .feed li span { flex: 1; }
+  .stats { display: flex; gap: 10px; font-size: 12px; color: var(--muted); flex-wrap: wrap; }
+  .stats b { color: var(--text); }
+  .toast { position: fixed; bottom: 10px; left: 10px; right: 10px; background: var(--text); color: var(--bg); padding: 8px 12px;
+    border-radius: 7px; font-size: 12px; box-shadow: 0 4px 14px rgba(0,0,0,.2); }
+  .foot { display: flex; gap: 10px; justify-content: center; flex-wrap: wrap; font-size: 12px; }
+  .ltr { direction: ltr; text-align: left; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="head">
+    <span class="brand"><b>◆</b> Team Hub</span>
+    <span id="status" class="pill connecting hidden"></span>
+    <span class="grow" style="flex:1"></span>
+    <span id="who" class="muted"></span>
+  </div>
+
+  <div id="update" class="warn row hidden">
+    <span class="grow" id="update-text"></span>
+    <button class="primary small" data-act="update_plugin">تحديث</button>
+  </div>
+
+  <!-- Login -->
+  <form id="login" class="card hidden">
+    <h2>تسجيل الدخول</h2>
+    <label>عنوان السيرفر<input name="server" class="ltr" placeholder="http://26.x.x.x:8787" required></label>
+    <label>اسم المستخدم<input name="username" class="ltr" required autocomplete="username"></label>
+    <label>كلمة السر<input name="password" type="password" class="ltr" required autocomplete="current-password"></label>
+    <button class="primary" style="width:100%">دخول</button>
+    <p class="muted" style="margin:8px 0 0;font-size:12px">العنوان تاخذه من صاحب السيرفر. إذا تشتغل من البيت، لازم Radmin VPN يكون شغال.</p>
+  </form>
+
+  <!-- Choose project -->
+  <div id="choose" class="hidden">
+    <div class="card">
+      <h3>هذا الملف</h3>
+      <div id="file-info"></div>
+    </div>
+    <div class="card">
+      <div class="row" style="margin-bottom:6px"><h3 class="grow" style="margin:0">المشاريع</h3><button class="small" data-act="projects">تحديث</button></div>
+      <ul id="projects"></ul>
+      <form id="new-project" class="row hidden" style="margin-top:8px">
+        <input name="name" class="grow" placeholder="اسم مشروع جديد" required>
+        <button class="small">إنشاء</button>
+      </form>
+    </div>
+  </div>
+
+  <!-- Connected -->
+  <div id="live" class="hidden">
+    <div class="card">
+      <div class="row" style="margin-bottom:8px">
+        <h2 class="grow" id="project-name" style="margin:0"></h2>
+      </div>
+      <div class="stats" id="stats"></div>
+      <div class="grid3" style="margin-top:10px">
+        <button class="primary" data-act="reserve" title="احجز العناصر المحددة حتى تعدل عليها">حجز المحدد</button>
+        <button data-act="release" title="يرفع آخر تعديلاتك ويفك الحجز">إلغاء حجز المحدد</button>
+        <button data-act="release_all">إلغاء كل حجوزاتي</button>
+      </div>
+      <div id="warnings" style="display:flex;flex-direction:column;gap:6px;margin-top:8px"></div>
+    </div>
+
+    <div class="card">
+      <h3>الفريق المتصل</h3>
+      <ul id="online"></ul>
+    </div>
+
+    <div class="card">
+      <div class="tabs" id="tabs">
+        <button data-tab="objects" class="active">العناصر</button>
+        <button data-tab="activity">النشاط</button>
+        <button data-tab="chat">الدردشة <span id="chat-badge" class="pill online hidden"></span></button>
+      </div>
+      <div data-view="objects">
+        <div class="filters" id="filters">
+          <button data-f="all" class="active">الكل</button>
+          <button data-f="mine">حجوزاتي</button>
+          <button data-f="locked">محجوز من غيري</button>
+          <button data-f="free">متاح</button>
+        </div>
+        <input id="search" placeholder="بحث…" style="margin-bottom:6px">
+        <ul id="objects" class="scroll"></ul>
+      </div>
+      <div data-view="activity" class="hidden">
+        <ul id="feed" class="feed scroll"></ul>
+      </div>
+      <div data-view="chat" class="hidden">
+        <div id="chat" class="chat"></div>
+        <form id="chat-form" class="row">
+          <input name="text" class="grow" placeholder="رسالة للفريق…" autocomplete="off">
+          <button class="primary small">إرسال</button>
+        </form>
+      </div>
+    </div>
+
+    <div class="foot">
+      <button class="link" data-act="resync">مزامنة كاملة</button>
+      <button class="link" data-act="dashboard">لوحة التحكم</button>
+      <button class="link" data-act="disconnect">قطع الاتصال</button>
+    </div>
+  </div>
+
+  <div class="foot" id="account-foot">
+    <button class="link hidden" id="logout" data-act="logout">تسجيل خروج</button>
+  </div>
+  <div class="foot muted" id="version" style="font-size:11px"></div>
+</div>
+<div id="toast" class="toast hidden"></div>
+
+<script>
+'use strict';
+const $ = (s) => document.querySelector(s);
+const esc = (s) => String(s == null ? '' : s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const act = (name, payload) => { try { sketchup.th(name, JSON.stringify(payload || {})); } catch (e) { console.log(name, payload); } };
+const time = (t) => t ? new Date(t).toLocaleTimeString('ar-IQ', { hour: '2-digit', minute: '2-digit' }) : '';
+const STATUS = { online: 'متصل', offline: 'غير متصل', connecting: 'يتصل…' };
+
+const TH = {
+  s: null, filter: 'all', tab: 'objects', seenChat: 0, prefilled: false,
+
+  render(s) {
+    this.s = s;
+    const loggedIn = s.logged_in;
+    const up = s.update;
+    $('#update').classList.toggle('hidden', !up || s.busy === 'update');
+    if (up) $('#update-text').textContent = `نسخة جديدة من البلكن (${up.version}) موجودة على السيرفر. عندك ${s.version}.`;
+    $('#version').textContent = `${s.su_version || ''} · Team Hub ${s.version}`;
+    $('#login').classList.toggle('hidden', loggedIn);
+    $('#choose').classList.toggle('hidden', !loggedIn || s.connected);
+    $('#live').classList.toggle('hidden', !s.connected);
+    $('#logout').classList.toggle('hidden', !loggedIn);
+    $('#who').textContent = s.me ? s.me.display_name : '';
+    const st = $('#status');
+    st.classList.toggle('hidden', !s.connected);
+    if (s.connected) { st.textContent = STATUS[s.status] || s.status; st.className = `pill ${s.status}`; }
+
+    if (!loggedIn) {
+      if (!this.prefilled) {
+        const f = $('#login');
+        f.server.value = s.server || '';
+        f.username.value = s.username || '';
+        this.prefilled = true;
+      }
+      return;
+    }
+    if (!s.connected) return this.renderChoose(s);
+    this.renderLive(s);
+  },
+
+  appLabel(u) {
+    const apps = u.apps || [];
+    if (apps.length) return apps.map((a) => esc(a.su)).join('، ');
+    return u.clients.includes('sketchup') ? 'SketchUp' : 'متصفح';
+  },
+
+  renderChoose(s) {
+    const b = s.binding;
+    $('#file-info').innerHTML = `<div><b>${esc(s.model_title || 'بدون اسم')}</b></div>` + (b
+      ? `<div class="sub">مربوط بمشروع «${esc(b.project_name)}»</div>`
+      : `<div class="sub">${s.model_empty ? 'ملف فارغ، تكدر تحمّل بيه مشروع' : 'ملف مو مربوط بأي مشروع'}</div>`);
+    const admin = s.me && s.me.role === 'admin';
+    $('#new-project').classList.toggle('hidden', !admin);
+    const projects = s.projects || [];
+    $('#projects').innerHTML = projects.length ? projects.map((p) => {
+      let actions = '';
+      if (b && b.project_id === p.id) actions = `<button class="primary small" data-connect="${p.id}" data-mode="resume">اتصال</button>`;
+      else if (!b) {
+        actions = `<button class="small ${s.model_empty ? 'primary' : ''}" data-connect="${p.id}" data-mode="download" title="ينزل المشروع كامل بملف فارغ">تحميل المشروع</button>`;
+        if (!s.model_empty && p.objects === 0 && s.me.role !== 'viewer') {
+          actions += ` <button class="small primary" data-connect="${p.id}" data-mode="upload" title="يرفع محتوى هذا الملف كبداية للمشروع">رفع هذا الملف</button>`;
+        }
+      }
+      return `<li class="item"><div class="grow" style="flex:1;min-width:0"><b>${esc(p.name)}</b>
+        <div class="sub">${p.objects} عنصر · ${p.online} متصل</div></div><div class="row">${actions}</div></li>`;
+    }).join('') : '<li class="muted">ماكو مشاريع</li>';
+  },
+
+  renderLive(s) {
+    $('#project-name').textContent = s.project ? s.project.name : '';
+    const parts = [`<span><b>${s.total}</b> عنصر</span>`, `<span>حجوزاتي <b>${s.my_count}</b></span>`];
+    if (s.uploads) parts.push(`<span>يرفع <b>${s.uploads}</b></span>`);
+    if (s.downloads) parts.push(`<span>ينزّل <b>${s.downloads}</b></span>`);
+    if (!s.uploads && !s.downloads && s.status === 'online' && s.loaded) parts.push('<span style="color:var(--ok)">✓ متزامن</span>');
+    $('#stats').innerHTML = parts.join('');
+
+    const warns = [];
+    if (s.status === 'offline') warns.push('الاتصال بالسيرفر مقطوع. تعديلاتك محفوظة وراح ترتفع من يرجع الاتصال. تأكد من Radmin VPN.');
+    if (s.raw_geometry > 0) warns.push(`أكو ${s.raw_geometry} خط/سطح مو داخل Group، وهذني ما يوصلون للفريق. حطهم داخل Group أو Component.`);
+    if (s.me && s.me.role === 'viewer') warns.push('حسابك مشاهدة فقط.');
+    $('#warnings').innerHTML = warns.map((w) => `<div class="warn">${esc(w)}</div>`).join('');
+
+    const users = {};
+    (s.users || []).forEach((u) => { users[u.id] = u; });
+    this.users = users;
+    $('#online').innerHTML = (s.online || []).length ? s.online.map((u) => `
+      <li class="item"><span class="dot" style="background:${esc(u.color)}"></span>
+        <div style="flex:1;min-width:0"><b>${esc(u.display_name)}</b>${u.id === s.me.id ? ' <span class="sub">(أنت)</span>' : ''}
+        ${u.status && u.status.text ? `<div class="sub">${esc(u.status.text)}</div>` : ''}</div>
+        <span class="sub">${this.appLabel(u)}</span></li>`).join('')
+      : '<li class="muted">محد متصل</li>';
+
+    this.renderObjects();
+    this.renderFeed();
+    this.renderChat();
+  },
+
+  renderObjects() {
+    const s = this.s;
+    if (!s || !s.connected) return;
+    const q = $('#search').value.trim().toLowerCase();
+    const list = s.objects.filter((o) => {
+      if (this.filter === 'mine' && !o.mine) return false;
+      if (this.filter === 'locked' && (o.mine || !o.lock)) return false;
+      if (this.filter === 'free' && (o.mine || o.lock)) return false;
+      return !q || `${o.name} ${o.layer}`.toLowerCase().includes(q);
+    });
+    const canEdit = s.me.role !== 'viewer';
+    $('#objects').innerHTML = list.length ? list.slice(0, 400).map((o) => {
+      const holder = o.lock && this.users[o.lock];
+      let tag;
+      if (o.mine) tag = `<span class="tag" style="color:var(--ok)">● أنت${o.pending ? ' · يرفع…' : ''}</span>`;
+      else if (o.lock) tag = `<span class="tag"><span class="dot" style="background:${esc(holder ? holder.color : '#999')}"></span>${esc(holder ? holder.display_name : '؟')}</span>`;
+      else tag = '<span class="tag muted">متاح</span>';
+      let btn = '';
+      if (canEdit && o.mine) btn = `<button class="small" data-release="${esc(o.oid)}">فك</button>`;
+      else if (canEdit && !o.lock) btn = `<button class="small" data-reserve="${esc(o.oid)}">حجز</button>`;
+      return `<li class="item"><div class="name" data-focus="${esc(o.oid)}" title="اضغط حتى تروح للعنصر">${esc(o.name)}
+        <div class="sub">${o.kind === 'component' ? 'مكوّن' : 'مجموعة'} · ${esc(o.layer)}${o.rev ? ` · r${o.rev}` : ''}</div></div>${tag}${btn}</li>`;
+    }).join('') + (list.length > 400 ? `<li class="muted">… و${list.length - 400} غيرهم، استخدم البحث</li>` : '')
+      : '<li class="muted">ماكو عناصر</li>';
+  },
+
+  describe(e) {
+    const u = e.user;
+    const who = `<b style="color:${esc(u ? u.color : '')}">${esc(u ? u.display_name : 'النظام')}</b>`;
+    const p = e.payload || {};
+    const n = (oids) => oids.length > 1 ? `${oids.length} عناصر` : 'عنصر';
+    switch (e.type) {
+      case 'object':
+        if (p.kind === 'definition') return `${who} حدّث تعريف المكوّن «${esc(p.name)}»`;
+        return p.deleted ? `${who} حذف «${esc(p.name || '')}»` : p.rev === 1 ? `${who} أضاف «${esc(p.name || '')}»` : `${who} عدّل «${esc(p.name || '')}»`;
+      case 'lock': return `${who} حجز ${n(p.oids)}`;
+      case 'unlock': return `${who} فك حجز ${n(p.oids)}${p.reason === 'timeout' ? ' (انتهى الوقت)' : p.reason === 'forced' ? ' (المدير)' : ''}`;
+      case 'chat': return `${who}: ${esc(p.text)}`;
+      default: return `${who} ${esc(e.type)}`;
+    }
+  },
+
+  renderFeed() {
+    const ev = (this.s.events || []).slice().reverse();
+    $('#feed').innerHTML = ev.length ? ev.map((e) => `<li><span>${this.describe(e)}</span><time>${time(e.at)}</time></li>`).join('')
+      : '<li class="muted">ماكو نشاط بعد</li>';
+  },
+
+  renderChat() {
+    const chats = (this.s.events || []).filter((e) => e.type === 'chat');
+    const box = $('#chat');
+    const atBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 30;
+    box.innerHTML = chats.length ? chats.map((e) => `<div class="msg"><b style="color:${esc(e.user && e.user.color)}">${esc(e.user && e.user.display_name)}</b>
+      <time>${time(e.at)}</time><div>${esc(e.payload.text)}</div></div>`).join('') : '<div class="muted">ماكو رسائل</div>';
+    if (atBottom) box.scrollTop = box.scrollHeight;
+    const last = chats.length ? chats[chats.length - 1].seq : 0;
+    if (this.tab === 'chat') this.seenChat = last;
+    const unread = chats.filter((e) => e.seq > this.seenChat && (!e.user || e.user.id !== this.s.me.id)).length;
+    const badge = $('#chat-badge');
+    badge.textContent = unread;
+    badge.classList.toggle('hidden', !unread);
+  },
+
+  toast(text) {
+    const t = $('#toast');
+    t.textContent = text;
+    t.classList.remove('hidden');
+    clearTimeout(this._t);
+    this._t = setTimeout(() => t.classList.add('hidden'), 4500);
+  },
+};
+
+$('#login').addEventListener('submit', (ev) => {
+  ev.preventDefault();
+  const f = ev.target;
+  act('login', { server: f.server.value.trim(), username: f.username.value.trim(), password: f.password.value });
+  f.password.value = '';
+});
+
+$('#new-project').addEventListener('submit', (ev) => {
+  ev.preventDefault();
+  act('create_project', { name: ev.target.name.value.trim() });
+  ev.target.reset();
+});
+
+$('#chat-form').addEventListener('submit', (ev) => {
+  ev.preventDefault();
+  const t = ev.target.text.value.trim();
+  if (t) act('chat', { text: t });
+  ev.target.reset();
+});
+
+document.addEventListener('click', (ev) => {
+  const el = ev.target.closest('[data-act],[data-connect],[data-focus],[data-reserve],[data-release],[data-tab],[data-f]');
+  if (!el) return;
+  const d = el.dataset;
+  if (d.act) act(d.act);
+  else if (d.connect) act('connect', { project_id: Number(d.connect), mode: d.mode });
+  else if (d.focus) act('focus', { oid: d.focus });
+  else if (d.reserve) act('reserve_oid', { oid: d.reserve });
+  else if (d.release) act('release_oid', { oid: d.release });
+  else if (d.tab) {
+    TH.tab = d.tab;
+    document.querySelectorAll('#tabs button').forEach((b) => b.classList.toggle('active', b === el));
+    document.querySelectorAll('[data-view]').forEach((v) => v.classList.toggle('hidden', v.dataset.view !== d.tab));
+    if (TH.s) TH.renderChat();
+  } else if (d.f) {
+    TH.filter = d.f;
+    document.querySelectorAll('#filters button').forEach((b) => b.classList.toggle('active', b === el));
+    TH.renderObjects();
+  }
+});
+
+$('#search').addEventListener('input', () => TH.renderObjects());
+window.addEventListener('load', () => act('ready'));
+</script>
+</body>
+</html>

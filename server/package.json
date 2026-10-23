@@ -1,0 +1,16 @@
+{
+  "name": "sketchup-team-hub-server",
+  "version": "1.0.0",
+  "description": "Team Hub: shared SketchUp project server (accounts, reservations, revisions, live sync)",
+  "main": "server.js",
+  "private": true,
+  "scripts": {
+    "start": "node --no-warnings=ExperimentalWarning server.js"
+  },
+  "engines": {
+    "node": ">=22.13"
+  },
+  "dependencies": {
+    "ws": "8.18.3"
+  }
+}

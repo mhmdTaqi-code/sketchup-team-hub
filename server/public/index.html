@@ -1,0 +1,183 @@
+<!doctype html>
+<html lang="ar" dir="rtl">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Team Hub</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <!-- Setup / login -->
+  <section id="auth" class="auth hidden">
+    <div class="card auth-card">
+      <div class="brand"><span class="logo">◆</span> Team Hub <small>SketchUp</small></div>
+      <form id="setup-form" class="hidden">
+        <h2>إعداد السيرفر لأول مرة</h2>
+        <p class="muted">سوّي حساب المدير. هذا الحساب يتحكم بالفريق والمشاريع.</p>
+        <label>اسم المستخدم (إنكليزي)<input name="username" required autocomplete="username" dir="ltr"></label>
+        <label>الاسم الظاهر<input name="display_name" required></label>
+        <label>كلمة السر (6 أحرف أو أكثر)<input name="password" type="password" required minlength="6" autocomplete="new-password" dir="ltr"></label>
+        <label>اسم أول مشروع<input name="project" value="المشروع الأول" required></label>
+        <button class="btn primary" type="submit">إنشاء الحساب</button>
+        <p class="error" data-error></p>
+      </form>
+      <form id="login-form" class="hidden">
+        <h2>تسجيل الدخول</h2>
+        <label>اسم المستخدم<input name="username" required autocomplete="username" dir="ltr"></label>
+        <label>كلمة السر<input name="password" type="password" required autocomplete="current-password" dir="ltr"></label>
+        <button class="btn primary" type="submit">دخول</button>
+        <p class="error" data-error></p>
+      </form>
+      <p id="setup-remote" class="muted hidden">السيرفر بعده ما متجهز. افتح هذي الصفحة من جهاز السيرفر نفسه (localhost) حتى تسوي حساب المدير.</p>
+    </div>
+  </section>
+
+  <!-- App -->
+  <div id="app" class="app hidden">
+    <header class="topbar">
+      <div class="brand"><span class="logo">◆</span> Team Hub</div>
+      <select id="project-select" aria-label="المشروع"></select>
+      <span id="conn" class="pill off">غير متصل</span>
+      <div class="spacer"></div>
+      <span id="me" class="me"></span>
+      <button id="logout" class="btn ghost small">خروج</button>
+    </header>
+    <nav class="tabs" id="tabs">
+      <button data-tab="overview" class="active">نظرة عامة</button>
+      <button data-tab="objects">العناصر</button>
+      <button data-tab="activity">النشاط</button>
+      <button data-tab="team" data-admin>الفريق</button>
+      <button data-tab="projects" data-admin>المشاريع</button>
+      <button data-tab="connect">طريقة الربط</button>
+    </nav>
+
+    <main>
+      <section data-view="overview">
+        <div class="stats" id="stats"></div>
+        <div class="grid2">
+          <div class="card">
+            <h3>متصلين هسه</h3>
+            <ul id="online" class="people"></ul>
+          </div>
+          <div class="card">
+            <h3>الحجوزات الحالية</h3>
+            <ul id="lock-summary" class="list"></ul>
+          </div>
+        </div>
+        <div class="card">
+          <h3>دردشة الفريق</h3>
+          <div id="chat" class="chat"></div>
+          <form id="chat-form" class="row">
+            <input name="text" placeholder="اكتب رسالة للفريق…" autocomplete="off">
+            <button class="btn primary">إرسال</button>
+          </form>
+        </div>
+      </section>
+
+      <section data-view="objects" class="hidden">
+        <div class="card">
+          <div class="row">
+            <h3 class="grow">عناصر المشروع</h3>
+            <input id="obj-filter" placeholder="بحث بالاسم أو الطبقة…">
+            <label class="check"><input type="checkbox" id="obj-deleted"> المحذوفة</label>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>الاسم</th><th>النوع</th><th>الطبقة</th><th>النسخة</th><th>آخر تعديل</th><th>الحجز</th><th></th></tr></thead>
+              <tbody id="obj-rows"></tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
+      <section data-view="activity" class="hidden">
+        <div class="card">
+          <h3>سجل النشاط</h3>
+          <ul id="activity" class="feed"></ul>
+        </div>
+      </section>
+
+      <section data-view="team" class="hidden">
+        <div class="card">
+          <h3>إضافة عضو</h3>
+          <form id="user-form" class="form-grid">
+            <label>اسم المستخدم<input name="username" required dir="ltr"></label>
+            <label>الاسم الظاهر<input name="display_name" required></label>
+            <label>كلمة السر<input name="password" type="password" required minlength="6" dir="ltr"></label>
+            <label>الصلاحية
+              <select name="role">
+                <option value="editor">مصمم (يحجز ويعدل)</option>
+                <option value="viewer">مشاهد فقط</option>
+                <option value="admin">مدير</option>
+              </select>
+            </label>
+            <button class="btn primary">إضافة</button>
+            <p class="error" data-error></p>
+          </form>
+        </div>
+        <div class="card">
+          <h3>الفريق</h3>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>العضو</th><th>اسم المستخدم</th><th>الصلاحية</th><th>الحالة</th><th></th></tr></thead>
+              <tbody id="user-rows"></tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
+      <section data-view="projects" class="hidden">
+        <div class="card">
+          <h3>مشروع جديد</h3>
+          <form id="project-form" class="row">
+            <input name="name" placeholder="اسم المشروع" required>
+            <button class="btn primary">إنشاء</button>
+          </form>
+        </div>
+        <div class="card">
+          <h3>المشاريع</h3>
+          <ul id="project-list" class="list"></ul>
+        </div>
+      </section>
+
+      <section data-view="connect" class="hidden">
+        <div class="card">
+          <h3>عنوان السيرفر للفريق</h3>
+          <p class="muted">كل عضو يكتب واحد من هذي العناوين داخل البلكن بـ SketchUp. للربط عن بعد استخدم عنوان Radmin VPN (يبدي عادةً بـ 26.).</p>
+          <ul id="addresses" class="list mono"></ul>
+        </div>
+        <div class="card">
+          <h3>البلكن</h3>
+          <p class="muted">نفس البلكن لكل الفريق، شنو ما جانت نسخة SketchUp. العضو ينزله من هنا، أو من الرابط <code>/download/su_team_hub.rbz</code> على عنوان السيرفر.</p>
+          <div id="plugin-box" class="row"></div>
+        </div>
+        <div class="card">
+          <h3>خطوات ربط عضو جديد</h3>
+          <ol class="steps">
+            <li>ينصب Radmin VPN ويدخل نفس الشبكة (Join Network) باسمها وكلمة سرها.</li>
+            <li>ينزل البلكن من فوك وينصب <code>su_team_hub.rbz</code> من SketchUp ← Extensions ← Extension Manager ← Install Extension.</li>
+            <li>يفتح Extensions ← Team Hub ← لوحة الفريق، ويكتب عنوان السيرفر واسم المستخدم وكلمة السر.</li>
+            <li>يختار المشروع ويدوس «تحميل المشروع».</li>
+          </ol>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <dialog id="history-dialog">
+    <form method="dialog" class="dialog-body">
+      <h3 id="history-title">سجل العنصر</h3>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>النسخة</th><th>بواسطة</th><th>الوقت</th><th>الحجم</th><th>ملاحظة</th><th></th></tr></thead>
+          <tbody id="history-rows"></tbody>
+        </table>
+      </div>
+      <div class="row end"><button class="btn">إغلاق</button></div>
+    </form>
+  </dialog>
+
+  <div id="toast" class="toast hidden"></div>
+  <script src="app.js"></script>
+</body>
+</html>
