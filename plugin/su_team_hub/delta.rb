@@ -283,30 +283,7 @@ module TeamHub
       pump_deltas
     end
 
-    def pump_deltas
-      return if @delta_sending || @stopped || (@delta_out || []).empty?
-      d = @delta_out.first
-      @delta_sending = true
-      @client.request(:post, "/api/projects/#{pid}/delta", d, timeout: 30) do |st, data|
-        @delta_sending = false
-        next if @stopped
-        if st == 200
-          @delta_out.shift
-          @status = :online
-        elsif st.zero?
-          @status = :offline
-          UI.start_timer(2, false) { guard { pump_deltas } }
-          next
-        else
-          @delta_out.shift
-          holder = data && data['user']
-          TeamHub.flash("ما انرسل تعديلك: #{holder ? "محجوز من #{holder['display_name']}" : (data && data['error'])}")
-          mark_checkpoint_needed(d['ctx'])
-        end
-        pump_deltas
-        notify
-      end
-    end
+    # pump_deltas: WebSocket first, HTTP fallback — see live_ws.rb
 
     # ------------------------------------------------------------ receiving
 

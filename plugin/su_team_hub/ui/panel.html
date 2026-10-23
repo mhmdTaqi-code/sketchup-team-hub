@@ -285,7 +285,7 @@ const TH = {
       st.className = 'syncstate busy';
       st.textContent = [s.uploads ? `⇪ يرفع ${s.uploads}` : '', s.downloads ? `⇩ ينزّل ${s.downloads}` : ''].filter(Boolean).join(' · ') + '…';
     } else if (!s.loaded) { st.className = 'syncstate busy'; st.textContent = 'يتصل…'; }
-    else { st.className = 'syncstate'; st.textContent = '⚡ لايف · متزامن'; }
+    else { st.className = 'syncstate'; st.textContent = s.transport === 'websocket' ? '⚡ لايف · WebSocket · متزامن' : '⚡ لايف · متزامن'; }
     const ping = s.ping != null ? ` · 📶 ${s.ping} ms` : '';
     st.textContent += ping;
     if (s.editing_by_others) parts.push(`<span>✎ ${s.editing_by_others} عنصر يعدّلون عليه هسه</span>`);

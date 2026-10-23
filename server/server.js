@@ -835,12 +835,22 @@ route('POST', '/api/projects/:pid/delta', async (ctx) => {
   if (!/^[A-Za-z0-9_-]{4,64}$/.test(target)) throw httpError(400, 'invalid_ctx');
   const lock = q.lock.get(p.id, target);
   if (lock && lock.user_id !== ctx.user.id) throw httpError(423, 'locked_by_other', { user: userBrief(lock.user_id) });
+  return applyDelta(p.id, ctx.user, b);
+});
+
+// Shared by the HTTP route and the WebSocket "delta" message.
+function applyDelta(pid, user, b) {
+  if (!['admin', 'editor'].includes(user.role)) throw httpError(403, 'forbidden');
+  const target = String(b.ctx || '');
+  if (!/^[A-Za-z0-9_-]{4,64}$/.test(target)) throw httpError(400, 'invalid_ctx');
+  const lock = q.lock.get(pid, target);
+  if (lock && lock.user_id !== user.id) throw httpError(423, 'locked_by_other', { user: userBrief(lock.user_id) });
   const rm = Array.isArray(b.rm) ? b.rm.slice(0, 20000).map(String) : [];
   const add = Array.isArray(b.add) ? b.add.slice(0, 20000) : [];
   if (!rm.length && !add.length) return { ok: true, empty: true };
-  const seq = tx(() => emit(p.id, 'delta', { ctx: target, rm, add, by: ctx.user.id, n: Number(b.n) || 0 }, ctx.user.id));
+  const seq = tx(() => emit(pid, 'delta', { ctx: target, rm, add, by: user.id, n: Number(b.n) || 0 }, user.id));
   return { ok: true, seq };
-});
+}
 
 // Claim objects I'm working on (and release the ones I'm done with).
 route('POST', '/api/projects/:pid/claim', async (ctx) => {
@@ -1441,7 +1451,15 @@ server.on('upgrade', (req, socket, head) => {
         }
         broadcastPresence(pid);
       } else if (msg.type === 'ping') {
-        ws.send(JSON.stringify({ type: 'pong', seq: q.project.get(pid).seq }));
+        // t is echoed back so the client can measure its round trip (ping)
+        ws.send(JSON.stringify({ type: 'pong', t: msg.t ?? null, seq: q.project.get(pid).seq }));
+        if (Number.isFinite(msg.ping)) { c.app = { ...(c.app || {}), ping: msg.ping }; }
+      } else if (msg.type === 'delta') {
+        // Live geometry operation over the open socket (no HTTP round trip).
+        let reply;
+        try { reply = { type: 'ack', id: msg.id ?? null, ...applyDelta(pid, c.user, msg) }; }
+        catch (e) { reply = { type: 'ack', id: msg.id ?? null, ok: false, status: e.status || 500, error: e.code || e.message, user: e.extra?.user }; }
+        ws.send(JSON.stringify(reply));
       }
     });
     ws.on('close', () => {

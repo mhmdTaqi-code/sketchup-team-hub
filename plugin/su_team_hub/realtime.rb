@@ -30,11 +30,12 @@ module TeamHub
       @tick_timer = UI.start_timer(TICK_INTERVAL, true) { guard { live_tick } }
       @poll_gen = (@poll_gen || 0) + 1
       @polling = false
+      start_ws # real-time channel; long-poll covers until it's open / if it drops
       poll
     end
 
     def poll
-      return if @polling || @stopped
+      return if @polling || @stopped || ws_open?
       @polling = true
       gen = @poll_gen
       path = "/api/projects/#{pid}/events?since=#{@seq}&limit=500&client=sketchup&wait=#{LONG_POLL_WAIT}" \
@@ -74,6 +75,18 @@ module TeamHub
     def live_tick
       return if @stopped || !@loaded
       now = Time.now
+      if ws_open?
+        if @last_ping_at.nil? || now - @last_ping_at >= PING_EVERY
+          @last_ping_at = now
+          ws_ping
+          send_ws_status
+        elsif status_text != @last_status_sent
+          send_ws_status
+        end
+        @last_status_sent = status_text
+        tick_claims(now)
+        return
+      end
       if @last_ping_at.nil? || now - @last_ping_at >= PING_EVERY
         @last_ping_at = now
         t0 = Time.now

@@ -38,7 +38,7 @@ module TeamHub
   class Session
     POLL_INTERVAL = 1.0
     SWEEP_INTERVAL = 3.0 # full check of every object for local changes
-    SCAN_DELAY = 0.3
+    SCAN_DELAY = 0.0 # check right after each operation
     MAX_PARALLEL_PUSHES = 4
     IDENTITY = Geom::Transformation.new
 
@@ -145,6 +145,7 @@ module TeamHub
         nil
       end
       untrack_all
+      stop_ws
       TeamHub.detach_overlay(@model, @overlay)
       @model.active_view.invalidate rescue nil
     end
@@ -457,7 +458,7 @@ module TeamHub
       pump_idle
     end
 
-    def pump_idle(delay = 0.05)
+    def pump_idle(delay = 0)
       return if @idle_timer || @stopped
       @idle_timer = UI.start_timer(delay, false) do
         @idle_timer = nil
@@ -546,6 +547,13 @@ module TeamHub
         cfp = content_fp(ent)
         content = @content_dirty.delete(oid) || @new_local[oid] ||
                   (@content_fp.key?(oid) && @content_fp[oid] != cfp)
+        # A component copy has no contents of its own: drawing inside it changes
+        # the shared definition (sent as deltas / definition checkpoint), not
+        # the copy — so don't re-send its position for that.
+        if content && ent.is_a?(Sketchup::ComponentInstance) && !@new_local[oid]
+          @content_fp[oid] = cfp
+          content = false
+        end
         if content && delta_live?(oid) && editing_now?(oid) &&
            Time.now - ((@last_cp ||= {})[oid] || Time.at(0)) < CHECKPOINT_EVERY
           @content_dirty[oid] = true # deltas carry it live; full copy later
@@ -557,11 +565,17 @@ module TeamHub
       end
 
       @def_dirty.keys.each do |did|
-        @def_dirty.delete(did)
         d = live_def(did)
-        next unless d
         d_oid = "d_#{did}"
+        open_here = d && ctx_of_root((@model.active_path || []).first) == d_oid
+        if d && delta_live?(d_oid) && open_here &&
+           Time.now - ((@last_cp ||= {})[d_oid] || Time.at(0)) < CHECKPOINT_EVERY
+          next # deltas carry it live; full definition copy later
+        end
+        @def_dirty.delete(did)
+        next unless d
         if mine?(d_oid)
+          (@last_cp ||= {})[d_oid] = Time.now
           request_push(d_oid, true)
         else
           holder = @users[@locks[d_oid]] || {}
@@ -905,7 +919,7 @@ module TeamHub
       return if latest && latest['rev'].to_i > obj['rev'].to_i
       return if latest && latest['updated_by'] == my_id && !obj['force'] && local_exists?(obj)
       if editing_now?(oid) || @pushing[oid] || @push_wanted.key?(oid) || @touched[oid] || @content_dirty[oid] ||
-         (obj['kind'] == 'loose' && !(@model.active_path || []).empty?)
+         (obj['kind'] == 'loose' && !(@model.active_path || []).empty?) || placement_unsafe?(obj)
         # I'm in the middle of it (or inside a Group, where loose geometry
         # would land in the wrong place): apply a moment later.
         UI.start_timer(2, false) { enqueue(obj) unless @stopped }
@@ -940,6 +954,22 @@ module TeamHub
           end
         end
       end
+    end
+
+    # While a Component is open for editing, SketchUp places every other copy
+    # of it (and new copies) relative to the open one. Setting a position then
+    # would land it somewhere else — wait until the edit context is closed.
+    def placement_unsafe?(obj)
+      path = @model.active_path
+      return false if path.nil? || path.empty?
+      open_defs = path.map(&:definition)
+      ent = live_entity(obj['oid'])
+      return true if ent && (path.include?(ent) || (ent.respond_to?(:definition) && open_defs.include?(ent.definition)))
+      if obj['kind'] == 'component'
+        d = live_def((obj['meta'] || {})['def'])
+        return true if d && open_defs.include?(d)
+      end
+      false
     end
 
     def editing_now?(oid)
@@ -1372,6 +1402,7 @@ module TeamHub
         uploads: @push_wanted.size + @pushing.size,
         raw_geometry: @raw_count,
         ping: @ping_ms,
+        transport: ws_open? ? 'websocket' : 'longpoll',
         editing_by_others: claims.count { |_, uid| uid != my_id },
         events: @events.last(80),
         last_error: @last_error,

@@ -6,7 +6,7 @@ require 'extensions.rb'
 
 module TeamHub
   PLUGIN_ID = 'su_team_hub'.freeze
-  PLUGIN_VERSION = '1.7.0'.freeze
+  PLUGIN_VERSION = '1.8.0'.freeze
 
   unless file_loaded?(__FILE__)
     ext = SketchupExtension.new('Team Hub', File.join(PLUGIN_ID, 'main'))
