@@ -737,7 +737,8 @@ route('GET', '/api/projects', (ctx) => {
 });
 
 route('POST', '/api/projects', async (ctx) => {
-  requireRole(ctx.user, 'admin');
+  // Any member can share a file, which creates a project for it.
+  requireRole(ctx.user, 'admin', 'editor');
   const b = await readJson(ctx.req);
   const name = String(b.name || '').trim();
   if (!name) throw httpError(400, 'name_required');

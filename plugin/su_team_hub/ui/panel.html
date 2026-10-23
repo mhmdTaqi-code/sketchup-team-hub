@@ -103,7 +103,7 @@
       <div id="file-info"></div>
     </div>
     <div class="card">
-      <div class="row" style="margin-bottom:6px"><h3 class="grow" style="margin:0">المشاريع</h3><button class="small" data-act="projects">تحديث</button></div>
+      <div class="row" style="margin-bottom:6px"><h3 class="grow" style="margin:0">الملفات المشتركة</h3><button class="small" data-act="projects">تحديث</button></div>
       <ul id="projects"></ul>
       <form id="new-project" class="row hidden" style="margin-top:8px">
         <input name="name" class="grow" placeholder="اسم مشروع جديد" required>
@@ -239,10 +239,11 @@ const TH = {
       let actions = '';
       if (b && b.project_id === p.id) actions = `<button class="primary small" data-connect="${p.id}" data-mode="resume">اتصال</button>`;
       else if (p.file) actions = `<button class="primary small" data-download="${p.id}">⇩ تحميل الملف المشترك</button>`;
-      const fileInfo = p.file ? `ملف مشترك ${(p.file.size / 1048576).toFixed(1)} MB` : 'ماكو ملف مشترك بعد';
+      const when = p.file && p.file.uploaded_at ? new Date(p.file.uploaded_at).toLocaleDateString('ar-IQ') : '';
+      const fileInfo = p.file ? `${(p.file.size / 1048576).toFixed(1)} MB${when ? ' · ' + when : ''}` : 'بعده ما انرفع';
       return `<li class="item"><div class="grow" style="flex:1;min-width:0"><b>${esc(p.name)}</b>
         <div class="sub">${fileInfo} · ${p.online} متصل</div></div><div class="row">${actions}</div></li>`;
-    }).join('') : '<li class="muted">ماكو مشاريع</li>';
+    }).join('') : '<li class="muted">ماكو ملفات مشتركة بعد. افتح أي ملف ودوس «مشاركة هذا الملف».</li>';
   },
 
   renderLive(s) {

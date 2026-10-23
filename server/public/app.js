@@ -206,6 +206,7 @@ async function handleEvent(e) {
 // ---------------------------------------------------------------- render
 
 function renderAll() {
+  renderSharedFiles();
   renderOverview();
   renderObjects();
   renderActivity();
@@ -250,6 +251,14 @@ function renderOverview() {
     <div class="msg"><b style="color:${esc(e.user?.color)}">${esc(e.user?.display_name)}</b><time>${fmtTime(e.at)}</time><div>${esc(e.payload.text)}</div></div>`).join('')
     : '<div class="empty">ماكو رسائل بعد</div>';
   if (atBottom) box.scrollTop = box.scrollHeight;
+}
+
+function renderSharedFiles() {
+  const list = (S.projects || []).filter((p) => p.file && !p.archived);
+  $('#shared-files').innerHTML = list.length ? list.map((p) => `<li>
+    <div class="grow"><b>${esc(p.name)}</b> <span class="muted">${fmtSize(p.file.size)} · ${fmtTime(p.file.uploaded_at)} · ${p.online} متصل</span></div>
+    <a class="btn small primary" href="/download/project/${p.id}.skp?token=${S.token}">تحميل .skp</a>
+  </li>`).join('') : '<li class="empty">ماكو ملفات مشتركة بعد</li>';
 }
 
 function renderObjects() {

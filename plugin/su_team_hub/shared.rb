@@ -44,7 +44,6 @@ module TeamHub
       binding = model_binding(model)
       project = binding && (@projects || []).find { |p| p['id'] == binding['project_id'] }
       return share_into(model, project) if project
-      return flash('بس المدير يكدر يسوي مشروع جديد. اطلب من صاحب السيرفر.') unless me && me['role'] == 'admin'
 
       name = File.basename(model.path, '.skp')
       set_busy('share', 'يسوي مشروع جديد…')

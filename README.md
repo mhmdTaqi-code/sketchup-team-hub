@@ -1,8 +1,8 @@
 # SketchUp Team Hub
 
-**Work on one SketchUp model as a team, at the same time.** One PC runs a small server; every teammate's SketchUp connects to it (over Radmin VPN or a local network). You reserve what you edit, your changes reach everyone within a second or two, and every version of every object is kept.
+**Work on one SketchUp model as a team, at the same time.** One PC runs a small server; every teammate's SketchUp connects to it (over Radmin VPN or a local network). Share any .skp once; teammates download it and from then on every change reaches everyone within a second or two. Every version is kept.
 
-- Reservations (locks) per Group / Component, shown in the viewport with the owner's name
+- Edit anything, any time — optional reservations when you want something to yourself
 - Automatic live sync — no "save and send"
 - Full history with one-click rollback, from a web dashboard
 - Works across SketchUp **2022 → 2026** in the same project
@@ -88,23 +88,27 @@
 3. يطلع شريط أدوات **Team Hub** وقائمة **Extensions ← Team Hub**.
 4. افتح **لوحة الفريق**، واكتب عنوان السيرفر واسم المستخدم وكلمة السر.
 
-## الخطوة 5: ابدأ المشروع
+## الخطوة 5: شارك ملف ويا الفريق
 
-- **عندك ملف جاهز:** افتحه ← من اللوحة اختار المشروع (لازم يكون فارغ) ← **رفع هذا الملف**.
-- **باقي الفريق:** يفتح ملف جديد فارغ ← **تحميل المشروع** ← يحفظ الملف عنده.
-- **بعدين:** من تفتح ملف المشروع، البلكن يتصل وحده ويجيب كل اللي تغير وانت غايب.
+1. افتح **أي ملف** بـ SketchUp ← لوحة الفريق ← **«⇪ مشاركة هذا الملف ويا الفريق»**.
+   - البلكن يرفع الملف كامل مرة وحدة.
+   - كل ملف تشاركه يصير مشروع مستقل.
+   - أي عضو يكدر يشارك، مو بس المدير.
+2. **باقي الفريق:** لوحة الفريق ← **«الملفات المشتركة»** ← **«⇩ تحميل الملف المشترك»**.
+   الملف ينزل وينفتح ويتصل وحده.
+   أو ينزلونه من لوحة التحكم بالمتصفح، ويفتحونه بـ SketchUp، ويتصل وحده هم.
+3. **من هنا وطالع:** بس التعديلات تنتقل، مو الملف كامل.
 
 ## الشغل اليومي
 
-1. حدد عنصر ← **حجز المحدد**، أو كلك يمين ← **Team Hub: حجز للتعديل**.
-2. عدّل. التعديل يرتفع وحده.
-3. من تخلص ← **إلغاء حجز المحدد**، حتى غيرك يكدر يعدل عليه.
-
-**قواعد مهمة:**
-- **كل شي لازم يكون داخل Group أو Component.** الخطوط والسطوح السائبة بالمستوى الأعلى ما تتزامن، واللوحة تنبهك عليها.
-- **قسّم الموديل لعناصر واضحة**، مثل: جدران الطابق الأرضي، السقف، الواجهة. هيج كل واحد يحجز جزئه.
-- العضو اللي يغيب أكثر من 30 دقيقة، حجوزاته تنفك وحدها. تكدر تغير المدة من `server/config.json`.
-- **شي ما يتزامن:** المشاهد (Scenes)، والستايل، وإظهار وإخفاء الطبقات. هذني خاصة بكل واحد.
+- **عدّل أي شي، بأي وقت.** التعديل يوصل للباقين خلال ثانية أو ثنتين.
+- **الشي اللي يعدّله صاحبك** يبين عندك بمربع ملوّن عليه اسمه، كم ثانية.
+- **إذا اثنين عدّلوا نفس الشي بنفس اللحظة**، يمشي تعديل آخر واحد.
+- **الحجز اختياري:** حدد الشي ← **«حجز المحدد»**. محد غيرك يكدر يعدّل عليه لحد ما تدوس **«إلغاء حجز المحدد»**.
+- **الخطوط والسطوح السائبة تتزامن هي هم**، ككتلة وحدة.
+  - إذا حجزتها، البلكن يسويها Group وحده.
+  - للشغل المتوازي على نفس المنطقة، الأفضل كل واحد يشتغل داخل Group.
+- **شي ما يتزامن:** المشاهد (Scenes)، والستايل، وإظهار وإخفاء الطبقات.
 
 ## حل المشاكل
 
