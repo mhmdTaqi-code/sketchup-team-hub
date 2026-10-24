@@ -1471,7 +1471,13 @@ module TeamHub
     def load_definition(path, meta = {}, placements = [])
       tmp = File.join(@temp, "load_#{SecureRandom.hex(6)}.skp")
       FileUtils.cp(path, tmp)
-      defn = @model.definitions.load(tmp)
+      # A teammate on a newer SketchUp may send a newer file format: accept it
+      # (allow_newer, SU 2021.1+) instead of refusing every one of their edits.
+      defn = begin
+        @model.definitions.load(tmp, allow_newer: true)
+      rescue ArgumentError, TypeError
+        @model.definitions.load(tmp)
+      end
       raise 'تعذر فتح ملف العنصر' unless defn
       align_definition(defn, meta, placements)
       defn
