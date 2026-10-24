@@ -109,6 +109,7 @@ module TeamHub
         model_title: model ? model.title : '',
         busy: @busy,
         busy_text: @busy_text,
+        login_error: @login_error,
         model_saved: model ? !model.path.to_s.empty? : false,
         update: @update,
         su_version: su_version_label,
@@ -125,6 +126,7 @@ module TeamHub
     def login(server, username, password)
       c = Client.new(server)
       @busy = 'login'
+      @login_error = nil
       panel_refresh
       c.request(:post, '/api/login', { 'username' => username, 'password' => password, 'client' => 'sketchup' }, timeout: 15) do |st, data|
         @busy = nil
@@ -133,12 +135,15 @@ module TeamHub
           set_pref('username', username)
           set_pref('token', data['token'])
           set_me(data['user'])
+          @login_error = nil
           flash("أهلاً #{data['user']['display_name']}")
           load_projects
         elsif st.zero?
-          flash("ما كدرت أوصل للسيرفر #{c.server}. تأكد من Radmin VPN والعنوان.")
+          @login_error = "السيرفر ما يجاوب (#{c.server}). تأكد إن نافذة start-server.bat مفتوحة بجهاز السيرفر، وإن Radmin VPN متصل، وإن العنوان صح."
+          flash(@login_error)
         else
-          flash('اسم المستخدم أو كلمة السر غلط')
+          @login_error = 'اسم المستخدم أو كلمة السر غلط. انتبه للأحرف الكبيرة والصغيرة، وإن اسم المستخدم بالإنكليزي (مثلاً mhmd).'
+          flash(@login_error)
         end
         panel_refresh
       end

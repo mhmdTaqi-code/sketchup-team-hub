@@ -7,5 +7,9 @@ if not exist node_modules (
   call npm install --no-audit --no-fund
 )
 echo Starting Team Hub server... keep this window open while the team is working.
+:run
 node --no-warnings=ExperimentalWarning server.js
-pause
+echo.
+echo The server stopped. Restarting in 3 seconds... (close this window to stop it for good)
+timeout /t 3 /nobreak >nul
+goto run
