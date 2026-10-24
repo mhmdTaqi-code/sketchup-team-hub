@@ -98,8 +98,6 @@
     <label>عنوان السيرفر<input name="server" class="ltr" placeholder="http://26.x.x.x:8787" required></label>
     <label>اسم المستخدم<input name="username" class="ltr" required autocomplete="username"></label>
     <label>كلمة السر<input name="password" type="password" class="ltr" required autocomplete="current-password"></label>
-    <label style="display:flex;gap:6px;align-items:center;font-size:12px"><input type="checkbox" id="showpw" style="width:auto">إظهار كلمة السر</label>
-    <p id="login-error" class="hidden" style="color:#c0392b;font-size:12.5px;margin:6px 0"></p>
     <button class="primary" style="width:100%">دخول</button>
     <p class="muted" style="margin:8px 0 0;font-size:12px">العنوان تاخذه من صاحب السيرفر. إذا تشتغل من البيت، لازم Radmin VPN يكون شغال.</p>
   </form>
@@ -233,12 +231,6 @@ const TH = {
     st.classList.toggle('hidden', !s.connected);
     if (s.connected) { st.textContent = STATUS[s.status] || s.status; st.className = `pill ${s.status}`; }
 
-    const le = $('#login-error');
-    le.textContent = s.login_error || '';
-    le.classList.toggle('hidden', !s.login_error || loggedIn);
-    $('#login button.primary').disabled = s.busy === 'login';
-    $('#login button.primary').textContent = s.busy === 'login' ? 'دا يدخل…' : 'دخول';
-    if (loggedIn) $('#login').password.value = ''; // forget it once signed in
     if (!loggedIn) {
       if (!this.prefilled) {
         const f = $('#login');
@@ -396,11 +388,9 @@ const TH = {
 $('#login').addEventListener('submit', (ev) => {
   ev.preventDefault();
   const f = ev.target;
-  // The password stays in the field until the login works, so a typo or a
-  // server that's down doesn't mean typing it all again.
   act('login', { server: f.server.value.trim(), username: f.username.value.trim(), password: f.password.value });
+  f.password.value = '';
 });
-$('#showpw').addEventListener('change', (ev) => { $('#login').password.type = ev.target.checked ? 'text' : 'password'; });
 
 $('#new-project').addEventListener('submit', (ev) => {
   ev.preventDefault();
