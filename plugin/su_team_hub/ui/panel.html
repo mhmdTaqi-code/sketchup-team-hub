@@ -268,6 +268,7 @@ const TH = {
         ? '<span class="tag" style="color:var(--ok)">● مفتوح هسه</span>'
         : `<button class="primary small" data-connect="${p.id}" data-mode="resume">اتصال</button>`;
       else if (p.file) actions = `<button class="primary small" data-download="${p.id}">⇩ تحميل الملف المشترك</button>`;
+      if (admin) actions += `<button class="small" data-del="${p.id}" data-name="${esc(p.name)}" title="حذف من قائمة الكل">🗑</button>`;
       const when = p.file && p.file.uploaded_at ? new Date(p.file.uploaded_at).toLocaleDateString('ar-IQ') : '';
       const fileInfo = p.file ? `${(p.file.size / 1048576).toFixed(1)} MB${when ? ' · ' + when : ''}` : 'بعده ما انرفع';
       return `<li class="item"><div class="grow" style="flex:1;min-width:0"><b>${esc(p.name)}</b>
@@ -406,13 +407,17 @@ $('#chat-form').addEventListener('submit', (ev) => {
 });
 
 document.addEventListener('click', (ev) => {
-  const el = ev.target.closest('[data-page],[data-act],[data-connect],[data-download],[data-focus],[data-reserve],[data-release],[data-tab],[data-f]');
+  const el = ev.target.closest('[data-page],[data-act],[data-connect],[data-download],[data-del],[data-focus],[data-reserve],[data-release],[data-tab],[data-f]');
   if (!el) return;
   const d = el.dataset;
   if (d.page) { TH.page = d.page; TH.render(TH.s); return; }
   if (d.act) act(d.act);
   else if (d.connect) act('connect', { project_id: Number(d.connect), mode: d.mode });
   else if (d.download) act('download_file', { project_id: Number(d.download) });
+  else if (d.del) {
+    if (confirm(`تحذف «${d.name}» من قائمة الكل؟
+الملف ما ينمسح نهائياً، يبقى محفوظ بالسيرفر.`)) act('delete_project', { project_id: Number(d.del) });
+  }
   else if (d.focus) act('focus', { oid: d.focus });
   else if (d.reserve) act('reserve_oid', { oid: d.reserve });
   else if (d.release) act('release_oid', { oid: d.release });

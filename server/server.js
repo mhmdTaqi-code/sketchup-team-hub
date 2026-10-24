@@ -854,6 +854,23 @@ route('PATCH', '/api/projects/:pid', async (ctx) => {
   return { project: q.project.get(p.id) };
 });
 
+// Admin: remove a project from everyone's list. Nothing is destroyed: the
+// project is archived and its shared file moved to files/deleted/.
+route('DELETE', '/api/projects/:pid', (ctx) => {
+  requireRole(ctx.user, 'admin');
+  const p = getProject(ctx.params.pid);
+  db.prepare('UPDATE projects SET archived = 1 WHERE id = ?').run(p.id);
+  const f = sharedFilePath(p.id);
+  if (fs.existsSync(f)) {
+    const dir = path.join(FILES_DIR, 'deleted');
+    fs.mkdirSync(dir, { recursive: true });
+    const keep = path.join(dir, `${Date.now()}_${path.basename(f)}`);
+    fs.renameSync(f, keep);
+    if (fs.existsSync(`${f}.json`)) fs.renameSync(`${f}.json`, `${keep}.json`);
+  }
+  return { ok: true };
+});
+
 route('GET', '/api/ping', () => ({ t: now() }));
 
 // "Send log" button in the plugin: the last part of its sync log, kept per user.
@@ -1100,6 +1117,13 @@ route('POST', '/api/projects/:pid/file/chunk', async (ctx) => {
     fs.writeFileSync(up.path, Buffer.alloc(0));
     b.upload_id = crypto.randomBytes(9).toString('hex');
     uploads.set(b.upload_id, up);
+  }
+  // A SketchUp project's file can be replaced only by an admin or whoever
+  // created the project (a teammate's newer-version copy once replaced the
+  // owner's and nobody on an older SketchUp could open the project).
+  if (index === 0 && (p.kind || 'sketchup') === 'sketchup' && sharedFileInfo(p) &&
+      ctx.user.role !== 'admin' && p.created_by !== ctx.user.id) {
+    throw httpError(403, 'only_owner_can_replace');
   }
   if (!up || up.pid !== p.id || up.user !== ctx.user.id) throw httpError(400, 'unknown_upload');
   if (index !== up.next) throw httpError(409, 'wrong_chunk', { expected: up.next });

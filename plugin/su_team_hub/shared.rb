@@ -43,6 +43,9 @@ module TeamHub
       end
       binding = model_binding(model)
       project = binding && (@projects || []).find { |p| p['id'] == binding['project_id'] }
+      if project && project['file'] && me['role'] != 'admin' && project['created_by'] != me['id']
+        return flash("ملف «#{project['name']}» يبدله بس المدير أو صاحب المشروع. شغلك يوصل للكل وحده، ما تحتاج تشاركه.")
+      end
       return share_into(model, project) if project
 
       name = File.basename(model.path, '.skp')
@@ -141,7 +144,8 @@ module TeamHub
       }
       client.request(:post, "/api/projects/#{project['id']}/file/chunk", body, timeout: 300) do |st, res|
         unless st == 200 && res
-          fail_busy("فشل رفع الملف (#{(res && res['error']) || st})")
+          msg = res && res['error'] == 'only_owner_can_replace' ? 'ملف هذا المشروع يبدله بس المدير أو صاحب المشروع' : "فشل رفع الملف (#{(res && res['error']) || st})"
+          fail_busy(msg)
           next done.call(false)
         end
         if final
@@ -150,6 +154,21 @@ module TeamHub
         else
           upload_shared(project, data, name, index + 1, res['upload_id'], &done)
         end
+      end
+    end
+
+    # Admin: take a project off everyone's list (the server keeps the file).
+    def delete_project(project_id)
+      project = (@projects || []).find { |p| p['id'] == project_id.to_i }
+      return flash('المشروع مو موجود') unless project
+      stop_session if @session && @session.pid == project['id']
+      client.request(:delete, "/api/projects/#{project['id']}") do |st, data|
+        if st == 200
+          flash("انحذف «#{project['name']}» من قائمة الكل")
+        else
+          flash("ما انحذف: #{(data && data['error']) || st}")
+        end
+        load_projects
       end
     end
 

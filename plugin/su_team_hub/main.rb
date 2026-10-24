@@ -321,6 +321,7 @@ module TeamHub
       when 'connect' then connect(payload['project_id'], payload['mode'])
       when 'share' then share_file
       when 'download_file' then download_shared(payload['project_id'])
+      when 'delete_project' then delete_project(payload['project_id'])
       when 'disconnect' then stop_session
       when 'reserve' then s&.reserve(Sketchup.active_model.selection.to_a)
       when 'release' then s&.release_entities(Sketchup.active_model.selection.to_a)
