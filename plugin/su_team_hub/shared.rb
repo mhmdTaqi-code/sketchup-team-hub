@@ -51,7 +51,7 @@ module TeamHub
       name = File.basename(model.path, '.skp')
       set_busy('share', 'يسوي مشروع جديد…')
       client.request(:post, '/api/projects', { 'name' => name }) do |st, data|
-        next fail_busy("ما انشأ المشروع: #{data && data['error']}") unless st == 200
+        next fail_busy("ما انشأ المشروع: #{request_problem(st, data)}") unless st == 200
         created = data['project']
         load_projects do
           share_into(model, (@projects || []).find { |p| p['id'] == created['id'] } || created)

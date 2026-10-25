@@ -57,6 +57,13 @@ module TeamHub
       Client.new(pref('server', ''), pref('token'))
     end
 
+    # Why a request failed, in words the team understands.
+    def request_problem(st, data)
+      return "السيرفر ما يجاوب (#{client.server}). تأكد إن نافذة Team Hub Server مفتوحة بجهاز السيرفر، وإن Radmin متصل." if st.zero?
+      return 'انتهت الجلسة، سجل دخول مرة ثانية' if st == 401
+      (data && (data['message'] || data['error'])) || "خطأ #{st}"
+    end
+
     def flash(text)
       Sketchup.status_text = "Team Hub: #{text}"
       panel.toast(text)
@@ -109,6 +116,7 @@ module TeamHub
         model_title: model ? model.title : '',
         busy: @busy,
         busy_text: @busy_text,
+        server_down: @server_down,
         model_saved: model ? !model.path.to_s.empty? : false,
         update: @update,
         su_version: su_version_label,
@@ -207,6 +215,7 @@ module TeamHub
       return unless logged_in?
       check_update
       client.request(:get, '/api/projects') do |st, data|
+        @server_down = st.zero?
         if st == 200 && data
           @projects = data['projects']
           after&.call
@@ -316,7 +325,7 @@ module TeamHub
       when 'projects' then load_projects
       when 'create_project'
         client.request(:post, '/api/projects', { 'name' => payload['name'] }) do |st, data|
-          st == 200 ? load_projects : flash("ما انشأ المشروع (#{data && data['error']})")
+          st == 200 ? load_projects : flash("ما انشأ المشروع: #{TeamHub.request_problem(st, data)}")
         end
       when 'connect' then connect(payload['project_id'], payload['mode'])
       when 'share' then share_file

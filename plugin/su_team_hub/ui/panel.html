@@ -112,6 +112,7 @@
     <div class="card">
       <div class="row" style="margin-bottom:6px"><h3 class="grow" style="margin:0">📁 الملفات المشتركة</h3><button class="small" data-act="projects">تحديث</button></div>
       <div class="sub" style="margin-bottom:6px">أي ملف يشاركه واحد من الفريق يطلع هنا. نزّله وينفتح ويتصل وحده.</div>
+      <p id="server-down" class="hidden" style="color:#c0392b;font-size:12.5px;margin:4px 0 8px"></p>
       <ul id="projects"></ul>
       <form id="new-project" class="row hidden" style="margin-top:8px">
         <input name="name" class="grow" placeholder="اسم مشروع جديد" required>
@@ -261,6 +262,9 @@ const TH = {
         <div class="sub" style="margin-top:4px">يرفع الملف كامل مرة وحدة، وصديقك ينزله ويبدي وياك.${s.model_saved ? '' : ' احفظه أول.'}</div>` : '');
     const admin = s.me && s.me.role === 'admin';
     $('#new-project').classList.toggle('hidden', !admin);
+    const sd = $('#server-down');
+    sd.textContent = s.server_down ? 'السيرفر ما يجاوب، فالقائمة فارغة. بجهاز السيرفر شغّل start-server.bat (أو تأكد إن نافذته مفتوحة)، وتأكد من Radmin، وبعدين دوس «تحديث».' : '';
+    sd.classList.toggle('hidden', !s.server_down);
     const projects = s.projects || [];
     $('#projects').innerHTML = projects.length ? projects.map((p) => {
       let actions = '';
