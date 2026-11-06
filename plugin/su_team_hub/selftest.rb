@@ -376,21 +376,25 @@ module TeamHub
         File.open(@cfg['trace'], 'a') { |f| f.puts("#{Time.now.strftime('%H:%M:%S.%L')} #{msg}"); f.flush }
       end
 
+      # Wraps the steps with a prepended module (like the crash breadcrumbs do):
+      # redefining the methods on Session itself would loop forever through
+      # the breadcrumb module's `super`.
       def install_trace
         me = self
+        mod = Module.new
         %i[scan scan_at_root heal_step request_sweep baseline_all apply_object push_now pump_pushes process_added
            process_removed live_tick run_jobs export_definition load_definition apply_definition apply_group
            apply_loose push_loose export_loose apply_local_locks refresh_overlay tick_claims scan_loose
            remove_definitions link_nested_definitions after_undo_reconcile].each do |name|
           next unless TeamHub::Session.method_defined?(name) || TeamHub::Session.private_method_defined?(name)
-          orig = TeamHub::Session.instance_method(name)
-          TeamHub::Session.send(:define_method, name) do |*args, &blk|
+          mod.send(:define_method, name) do |*args, &blk|
             me.trace(">#{name} #{args.first.is_a?(Hash) ? args.first['oid'] : args.first.class}")
-            r = orig.bind(self).call(*args, &blk)
+            r = super(*args, &blk)
             me.trace("<#{name}")
             r
           end
         end
+        TeamHub::Session.prepend(mod)
       end
 
       def step_r
@@ -545,13 +549,17 @@ module TeamHub
     end
   end
 
+  # Keep a test away from the real saved login: main.rb calls this right after
+  # defining pref/set_pref, before anything can connect with the real token.
+  def SelfTest.install_test_prefs
+    TeamHub.instance_variable_set(:@test_prefs, {})
+    TeamHub.define_singleton_method(:pref) { |key, default = nil| @test_prefs.key?(key) ? @test_prefs[key] : default }
+    TeamHub.define_singleton_method(:set_pref) { |key, value| @test_prefs[key] = value }
+  end
+
   if SelfTest.active?
-    # Keep the test away from the real saved login: once main.rb has finished
-    # defining pref/set_pref, replace them with an in-memory store.
     UI.start_timer(3, false) do
-      TeamHub.instance_variable_set(:@test_prefs, {})
-      TeamHub.define_singleton_method(:pref) { |key, default = nil| @test_prefs.key?(key) ? @test_prefs[key] : default }
-      TeamHub.define_singleton_method(:set_pref) { |key, value| @test_prefs[key] = value }
+      SelfTest.install_test_prefs # (again, in case main.rb was reloaded)
       TeamHub.stop_session
       SelfTest.start
     end

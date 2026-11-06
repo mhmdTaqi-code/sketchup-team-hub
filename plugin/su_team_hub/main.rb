@@ -435,6 +435,7 @@ module TeamHub
   end
 
   unless file_loaded?(__FILE__)
+    SelfTest.install_test_prefs if defined?(SelfTest) && SelfTest.active?
     check_previous_crash
     setup_ui
     Sketchup.add_observer(AppObs.new)
