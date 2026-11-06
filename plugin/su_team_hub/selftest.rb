@@ -332,6 +332,38 @@ module TeamHub
             ((Time.now - t) * 1000).round
           end
           check(times.max < 1500, "a full sweep of the big model stays short: #{times.inspect} ms")
+          edit('heavy group') do
+            g = model.entities.add_group
+            g.name = 'HEAVY'
+            3000.times do |i|
+              x = (i % 60) * 120
+              y = 40_000 + (i / 60) * 120
+              f = g.entities.add_face([x, y, 0], [x + 80, y, 0], [x + 80, y + 80, 0], [x, y + 80, 0])
+              f.pushpull(-50 - (i % 7))
+            end
+          end
+          nxt('made a heavy group (3000 boxes)')
+        when 3
+          return if since < 8 # its first upload
+          @heavy = group('HEAVY')
+          @heavy_oid = @heavy.get_attribute('TeamHub', 'oid')
+          @edits_at = Time.now
+          @edit_n = 0
+          nxt("heavy group is #{@heavy_oid}, first upload #{TeamHub.session.push_size(@heavy_oid)} bytes")
+        when 4
+          return if since < 1 # one edit a second, like someone working
+          @edit_n += 1
+          edit("heavy edit #{@edit_n}") { @heavy.entities.add_line([0, 39_000 + @edit_n * 10, 0], [50, 39_000 + @edit_n * 10, 0]) }
+          @edit_n >= 5 ? nxt('5 edits, one a second') : (@at = Time.now)
+        when 5
+          return if since < 15
+          pushes = File.read(TeamHub::LOG_PATH, encoding: 'UTF-8').lines.select do |l|
+            l.include?("PUSH #{@heavy_oid} ") && l[0, 23] >= @edits_at.strftime('%Y-%m-%d %H:%M:%S')
+          end
+          server = TeamHub.session.instance_variable_get(:@objects)[@heavy_oid]
+          lines = @heavy.entities.grep(Sketchup::Edge).count { |e| e.start.position.y.to_f.between?(39_000, 39_100) }
+          check(pushes.size.between?(1, 2), "5 quick edits of a #{(TeamHub.session.push_size(@heavy_oid) / 1e6).round(1)} MB group were sent #{pushes.size} time(s), not 5")
+          check(lines == 5 && server && TeamHub.session.send(:local_rev, server) == server['rev'].to_i, "the last edit is the one on the server (r#{server && server['rev']}, my edges #{lines})")
           log('DONE')
           @stage = -1
         end

@@ -346,6 +346,7 @@ module TeamHub
       when 'dashboard' then UI.openURL(pref('server', ''))
       when 'update_plugin' then install_update
       when 'send_log' then send_log
+      when 'lighten' then lighten_model
       end
       panel_refresh
     rescue StandardError => e

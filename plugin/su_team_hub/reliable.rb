@@ -83,6 +83,56 @@ module TeamHub
     end
   end
 
+  # "Lighten the project": drop what the file carries but nothing uses
+  # (component definitions, materials, tags, styles) as one undoable step,
+  # and name the heaviest objects so the team knows where the weight is.
+  def self.lighten_model
+    m = Sketchup.active_model
+    return flash('افتح ملف أول') unless m
+    before = [m.definitions.size, m.materials.size, m.layers.size]
+    purge = lambda do
+      m.definitions.purge_unused
+      m.materials.purge_unused
+      m.layers.purge_unused if m.layers.respond_to?(:purge_unused)
+      m.styles.purge_unused if m.styles.respond_to?(:purge_unused)
+    end
+    s = session
+    if s && !s.stopped? && s.model == m
+      s.send(:model_op, 'Team Hub: تخفيف المشروع') { purge.call }
+      s.send(:request_sweep)
+    else
+      m.start_operation('Team Hub: تخفيف المشروع', true)
+      purge.call
+      m.commit_operation
+    end
+    after = [m.definitions.size, m.materials.size, m.layers.size]
+    gone = before.zip(after).map { |b, a| b - a }
+    weight = {}
+    count = lambda do |d|
+      weight[d] ||= begin
+        weight[d] = 0 # cycles
+        d.entities.length + d.entities.grep(Sketchup::Group).sum { |g| count.call(g.definition) } +
+          d.entities.grep(Sketchup::ComponentInstance).map(&:definition).uniq.sum { |x| count.call(x) }
+      end
+    end
+    heavy = m.entities.select { |e| e.is_a?(Sketchup::Group) || e.is_a?(Sketchup::ComponentInstance) }
+             .map { |e| [e, count.call(e.definition)] }.sort_by { |_, n| -n }.first(5)
+    lines = heavy.map { |e, n| "• #{e.name.empty? ? e.definition.name : e.name}: #{n} عنصر" }
+    log_sync("LIGHTEN removed defs #{gone[0]}, materials #{gone[1]}, tags #{gone[2]}")
+    UI.messagebox("تم التخفيف (تكدر ترجعه بـ Ctrl+Z):
+"                   "• شلت #{gone[0]} تعريف كومبوننت ما مستعمل، و#{gone[1]} مادة، و#{gone[2]} Tag فارغ.
+
+"                   "أثقل العناصر بالملف:
+#{lines.join("
+")}
+
+"                   "العناصر الثقيلة (مثل ملفات CAD المستوردة) تتزامن بعد ما توكف تعدّل عليها كم ثانية، حتى ما يعلك السكيتش اب.
+"                   "إذا ما تحتاج تعدل عليها، خليها بـ Tag مخفي أو احذفها من الملف المشترك.")
+  rescue StandardError => e
+    log_error(e)
+    flash("ما كدرت أخفف: #{e.message}")
+  end
+
   def self.send_log
     text = File.exist?(LOG_PATH) ? File.read(LOG_PATH, encoding: 'UTF-8') : ''
     text = text[-2_000_000..] if text.size > 2_000_000
@@ -220,6 +270,7 @@ module TeamHub
         cheap = oid == LOOSE_OID ? loose_fp : (oid.start_with?('d_') ? (d = live_def(did_of(oid))) && defn_fp(d) : (e = live_entity(oid)) && content_fp(e))
         (@heal_ok ||= {})
         next if @heal_ok[oid] == [o['rev'], cheap]
+        next if push_size(oid) >= HEAVY_BYTES # hashing heavy contents freezes SketchUp
         have = object_sighash(oid)
         @heal_ok[oid] = [o['rev'], cheap] if have == want
         next if have.nil? || have == want

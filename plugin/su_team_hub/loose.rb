@@ -67,7 +67,7 @@ module TeamHub
       fp = loose_content_fp
       return if fp == @loose_base
       @loose_cp_at = Time.now
-      request_push(LOOSE_OID, true)
+      request_push(LOOSE_OID, true, fp)
     end
 
     def push_loose
@@ -77,6 +77,7 @@ module TeamHub
       body = { 'kind' => 'loose', 'name' => 'خطوط وسطوح سائبة', 'layer' => '', 'meta' => { 'empty' => list.empty? } }
       body['base_rev'] = loose_rev if @objects[LOOSE_OID] && !@objects[LOOSE_OID]['deleted']
       body['data'] = list.empty? ? ['EMPTY'].pack('m0') : export_loose
+      (@push_size ||= {})[LOOSE_OID] = body['data'].bytesize
       body['meta']['lt'] = @loose_export_t if @loose_export_t
       body['meta']['bb'] = @loose_export_bb if @loose_export_bb
       body['meta']['bb_space'] = 'local'

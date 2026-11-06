@@ -40,6 +40,13 @@ module TeamHub
     SWEEP_INTERVAL = 3.0 # full check of every object for local changes
     SCAN_DELAY = 0.0 # check right after each operation
     MAX_PARALLEL_PUSHES = 4
+    # Contents bigger than this (base64 bytes) are "heavy": an imported CAD
+    # drawing or a site model. Re-exporting and re-sending one after every
+    # single operation froze SketchUp for everyone, so a heavy object waits
+    # until its editor pauses (about 1 s per MB, 3-10 s), never longer than
+    # HEAVY_MAX_WAIT while the work goes on.
+    HEAVY_BYTES = 1_000_000
+    HEAVY_MAX_WAIT = 30
     IDENTITY = Geom::Transformation.new
 
     attr_reader :model, :client, :me, :project, :status
@@ -655,7 +662,7 @@ module TeamHub
           end
           next unless content || !@meta_fp.key?(oid) || @meta_fp[oid] != mfp
           (@last_cp ||= {})[oid] = Time.now if content
-          request_push(oid, content ? true : false)
+          request_push(oid, content ? true : false, cfp)
         rescue StandardError => e
           @touched[oid] = true
           @last_error = e.message
@@ -678,7 +685,7 @@ module TeamHub
           end
           if mine?(d_oid)
             (@last_cp ||= {})[d_oid] = Time.now
-            request_push(d_oid, true)
+            request_push(d_oid, true, defn_fp(d))
             @def_dirty.delete(did)
           else
             holder = @users[@locks[d_oid]] || {}
@@ -832,9 +839,46 @@ module TeamHub
       end
     end
 
-    def request_push(oid, content)
+    # fp: the contents' fingerprint now. A sweep that finds the same pending
+    # change again must not count as a new edit (that kept heavy objects
+    # waiting long after the user stopped).
+    def request_push(oid, content, fp = nil)
       @push_wanted[oid] = (@push_wanted[oid] || false) || content
+      if content
+        if fp.nil? || (@req_fp ||= {})[oid] != fp
+          (@changed_at ||= {})[oid] = Time.now
+          @req_fp[oid] = fp if fp
+        end
+        (@pending_since ||= {})[oid] ||= Time.now
+      end
       when_idle { pump_pushes }
+    end
+
+    def push_size(oid)
+      (@push_size ||= {})[oid] || (@objects[oid] && @objects[oid]['size']).to_i
+    end
+
+    # Seconds this content upload should still wait (0 = send now).
+    def heavy_wait(oid)
+      size = push_size(oid)
+      return 0 if size < HEAVY_BYTES
+      now = Time.now
+      quiet = now - ((@changed_at ||= {})[oid] || Time.at(0))
+      waited = now - ((@pending_since ||= {})[oid] || now)
+      return 0 if waited >= HEAVY_MAX_WAIT
+      need = [[size / 1_000_000.0, 3].max, 10].min
+      need = [need, 1.5].min unless editing_now?(oid) # left the group: send soon
+      quiet >= need ? 0 : need - quiet
+    end
+
+    def pump_later(delay)
+      at = Time.now + delay
+      return if @pump_at && @pump_at <= at
+      @pump_at = at
+      UI.start_timer(delay + 0.05, false) do
+        @pump_at = nil
+        guard { when_idle { pump_pushes } }
+      end
     end
 
     def pump_pushes
@@ -847,9 +891,17 @@ module TeamHub
         next if @pushing[oid]
         next unless mine?(oid)
         next if (@push_retry_at ||= {})[oid] && Time.now < @push_retry_at[oid]
+        if @push_wanted[oid] && (wait = heavy_wait(oid)) > 0
+          TeamHub.log_sync("WAIT heavy #{oid} #{(push_size(oid) / 1e6).round(1)} MB: #{wait.round(1)} s more") unless @pump_at
+          pump_later(wait)
+          next
+        end
         content = @push_wanted.delete(oid)
+        (@pending_since ||= {}).delete(oid) if content
         begin
+          t0 = Time.now
           with_root_coordinates { push_now(oid, content) }
+          @push_spent = (@push_spent || 0) + (Time.now - t0)
         rescue StandardError => e
           @pushing.delete(oid)
           @push_wanted[oid] = (@push_wanted[oid] || false) || content
@@ -908,9 +960,11 @@ module TeamHub
         mfp = meta_fp(ent)
       end
       body['base_rev'] = local_rev('oid' => oid, 'kind' => oid.start_with?('d_') ? 'definition' : 'object') if server && !server['deleted']
-      if body['data'] && (sh = object_sighash(oid))
+      # (no fingerprint for heavy contents: hashing them freezes SketchUp)
+      if body['data'] && body['data'].bytesize < HEAVY_BYTES && (sh = object_sighash(oid))
         body['meta'] = (body['meta'] || {}).merge('sighash' => sh)
       end
+      (@push_size ||= {})[oid] = body['data'].bytesize if body['data']
       TeamHub.log_sync("PUSH #{oid} #{body['kind']} #{body['data'] ? "contents #{body['data'].size}b64" : 'position'} base r#{body['base_rev'].inspect}")
 
       @pushing[oid] = true
@@ -942,6 +996,12 @@ module TeamHub
         @new_local.delete(oid)
         @meta_fp[oid] = mfp if mfp
         @content_fp[oid] = fp if fp
+        # A sweep during the upload saw "changed" against the old snapshot and
+        # queued the same contents again: nothing new, don't send it twice.
+        if fp && @push_wanted[oid] && (@req_fp ||= {})[oid] == fp && (!mfp || @meta_fp[oid] == mfp)
+          @push_wanted.delete(oid)
+          (@pending_since ||= {}).delete(oid)
+        end
         @status = :online
         holder = oid.start_with?('d_') ? live_def(did_of(oid)) : live_entity(oid)
         if holder.nil?
@@ -1227,6 +1287,7 @@ module TeamHub
     def verify_applied(obj)
       want = (obj['meta'] || {})['sighash']
       return unless want && !obj['meta_only'] && !obj['deleted']
+      return if obj['size'].to_i >= HEAVY_BYTES # hashing it would freeze SketchUp
       have = object_sighash(obj['oid'])
       return if have.nil?
       TeamHub.log_sync("VERIFY #{obj['oid']} r#{obj['rev']} contents #{have == want ? 'OK' : "MISMATCH #{have[0, 8]} != #{want[0, 8]}"}")
@@ -1663,6 +1724,7 @@ module TeamHub
       when_idle do
         @sweep_pending = false
         sweep_started = Time.now
+        spent_before = @push_spent || 0
         @index.each_key { |o| @touched[o] = true }
         @model.entities.each do |e|
           next unless trackable?(e)
@@ -1686,9 +1748,10 @@ module TeamHub
         scan
         pump_pushes
         heal_step
-        cost = Time.now - sweep_started
-        @next_sweep_at = Time.now + [cost * 10, 60].min
-        TeamHub.log_sync("SLOW sweep #{(cost * 1000).round} ms, next in #{(cost * 10).round(1)} s") if cost > 0.3
+        # uploads started by this sweep aren't the sweep's own cost
+        cost = Time.now - sweep_started - ((@push_spent || 0) - spent_before)
+        @next_sweep_at = Time.now + [cost * 10, 10].min
+        TeamHub.log_sync("SLOW sweep #{(cost * 1000).round} ms, next in #{[cost * 10, 10].min.round(1)} s") if cost > 0.3
       end
     end
 

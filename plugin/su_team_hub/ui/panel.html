@@ -259,7 +259,9 @@ const TH = {
       ? `<div class="sub">مربوط بمشروع «${esc(b.project_name)}»</div>`
       : `<div class="sub">${s.model_empty ? 'ملف فارغ' : 'ملف مو مربوط بأي مشروع'}</div>`) +
       (canShare ? `<button class="primary" data-act="share" style="width:100%;margin-top:8px">⇪ مشاركة هذا الملف ويا الفريق</button>
-        <div class="sub" style="margin-top:4px">يرفع الملف كامل مرة وحدة، وصديقك ينزله ويبدي وياك.${s.model_saved ? '' : ' احفظه أول.'}</div>` : '');
+        <div class="sub" style="margin-top:4px">يرفع الملف كامل مرة وحدة، وصديقك ينزله ويبدي وياك.${s.model_saved ? '' : ' احفظه أول.'}</div>` : '') +
+      (!s.model_empty ? `<button class="small" data-act="lighten" style="width:100%;margin-top:8px">🧹 تخفيف المشروع</button>
+        <div class="sub" style="margin-top:4px">يشيل الكومبوننتات والمواد والـ Tags اللي ما مستعملة، ويكلك شنو أثقل شي بالملف.</div>` : '');
     const admin = s.me && s.me.role === 'admin';
     $('#new-project').classList.toggle('hidden', !admin);
     const sd = $('#server-down');
@@ -415,7 +417,9 @@ document.addEventListener('click', (ev) => {
   if (!el) return;
   const d = el.dataset;
   if (d.page) { TH.page = d.page; TH.render(TH.s); return; }
-  if (d.act) act(d.act);
+  if (d.act) {
+    if (d.act !== 'lighten' || confirm('أخفف الملف؟ يشيل الكومبوننتات والمواد والـ Tags اللي ما مستعملة بأي مكان. تكدر ترجعها بـ Ctrl+Z.')) act(d.act);
+  }
   else if (d.connect) act('connect', { project_id: Number(d.connect), mode: d.mode });
   else if (d.download) act('download_file', { project_id: Number(d.download) });
   else if (d.del) {
